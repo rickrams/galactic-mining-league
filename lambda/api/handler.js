@@ -335,6 +335,8 @@ async function getLeaderboard(client, queryParams) {
         shipName: meta.shipName || 'Unknown',
         pilotName: meta.pilotName || 'Unknown',
         shipClass: meta.shipClass || 'Unknown',
+        totalSimulations: Number(meta.totalSimulations) || 0,
+        lifetimeOreHauled: Number(meta.lifetimeOreHauled) || 0,
       };
     });
 

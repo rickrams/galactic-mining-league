@@ -73,6 +73,8 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ entries, isLoading }) => {
             <th className="col-pilot">Pilot</th>
             <th className="col-class">Class</th>
             <th className="col-score">Ore Hauled</th>
+            <th className="col-lifetime">Lifetime</th>
+            <th className="col-sims">Sims</th>
             <th className="col-bar">Performance</th>
           </tr>
         </thead>
@@ -98,6 +100,12 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ entries, isLoading }) => {
                 <td className="col-score">
                   <span className="score-value">{formatScore(entry.score)}</span>
                   <span className="score-unit"> t</span>
+                </td>
+                <td className="col-lifetime">
+                  <span className="score-value">{entry.lifetimeOreHauled ? formatScore(entry.lifetimeOreHauled) : '—'}</span>
+                </td>
+                <td className="col-sims">
+                  <span className="score-value">{entry.totalSimulations || '—'}</span>
                 </td>
                 <td className="col-bar">
                   <div className="progress-track">

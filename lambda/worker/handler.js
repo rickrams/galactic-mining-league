@@ -194,13 +194,13 @@ exports.handler = async (event) => {
       }));
     }
 
-    // Update DynamoDB profiles — batch in groups of 25 to avoid throttling
+    // Update DynamoDB profiles and sync lifetime stats to Valkey hash
     if (PROFILES_TABLE) {
       const now = new Date().toISOString();
       const DDB_BATCH = 25;
       for (let i = 0; i < ships.length; i += DDB_BATCH) {
         const chunk = ships.slice(i, i + DDB_BATCH);
-        await Promise.all(chunk.map(ship =>
+        const ddbResults = await Promise.all(chunk.map(ship =>
           ddbClient.send(new UpdateCommand({
             TableName: PROFILES_TABLE,
             Key: { shipId: ship.shipId },
@@ -210,8 +210,26 @@ exports.handler = async (event) => {
               ':one': 1,
               ':ore': oreEarned[ship.shipId] || 0,
             },
-          })).catch(err => console.warn(`DDB update failed for ${ship.shipId}:`, err.message))
+            ReturnValues: 'ALL_NEW',
+          })).catch(err => { console.warn(`DDB update failed for ${ship.shipId}:`, err.message); return null; })
         ));
+
+        // Sync lifetime stats to Valkey hash for leaderboard enrichment
+        const hashBatch = new Batch(false);
+        for (let j = 0; j < chunk.length; j++) {
+          const result = ddbResults[j];
+          if (result && result.Attributes) {
+            const attrs = result.Attributes;
+            hashBatch.hset(`ship:${chunk[j].shipId}`, {
+              shipName: attrs.shipName || chunk[j].shipName,
+              pilotName: attrs.pilotName || chunk[j].pilotName,
+              shipClass: attrs.shipClass || chunk[j].shipClass,
+              totalSimulations: String(attrs.totalSimulations || 0),
+              lifetimeOreHauled: String(attrs.lifetimeOreHauled || 0),
+            });
+          }
+        }
+        await client.exec(hashBatch, false);
       }
     }
 

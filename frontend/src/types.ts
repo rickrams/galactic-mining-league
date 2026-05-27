@@ -5,6 +5,8 @@ export interface LeaderboardEntry {
   pilotName: string;
   shipClass: string;
   score: number;
+  totalSimulations?: number;
+  lifetimeOreHauled?: number;
 }
 
 export type TimeWindow = 'alltime' | 'daily' | 'weekly';

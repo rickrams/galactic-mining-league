@@ -379,7 +379,9 @@ body::before {
 .col-ship   { width: 180px; }
 .col-pilot  { width: 150px; color: var(--text-secondary); font-size: 0.9rem; }
 .col-class  { width: 130px; }
-.col-score  { width: 140px; text-align: right; }
+.col-score  { width: 120px; text-align: right; }
+.col-lifetime { width: 100px; text-align: right; color: var(--text-secondary); font-size: 0.85rem; }
+.col-sims   { width: 50px; text-align: center; color: var(--text-secondary); font-size: 0.85rem; }
 .col-bar    { }
 
 /* ---- Rank ---- */
