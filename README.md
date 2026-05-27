@@ -105,6 +105,8 @@ This is the **write-through cache** pattern: DynamoDB is the source of truth for
 
 ## Architecture: Two-Tier Storage
 
+> Full architecture diagrams, sequence flows, and design decisions: [ARCHITECTURE.md](ARCHITECTURE.md)
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  DynamoDB (GalacticMiningProfiles)                          │
