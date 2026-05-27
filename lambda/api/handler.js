@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
-const { GlideClient, Batch, InfBoundary, UpdateByScore } = require('@valkey/valkey-glide');
+const { GlideClient, Batch, InfBoundary, UpdateByScore, TimeUnit } = require('@valkey/valkey-glide');
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, ScanCommand, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
@@ -690,10 +690,20 @@ async function startSimulation(body) {
     }
   }
 
-  // Chunk into groups and fan-out worker Lambdas in parallel
+  // Cache selected profiles in Valkey as an ephemeral session.
+  // Workers pull their slice from cache instead of receiving full profile
+  // data in the invoke payload (avoids 256KB Lambda payload limit at scale).
+  const client = await getClient();
+  const sessionId = `sim-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
+  const sessionKey = `session:${sessionId}`;
+  const sessionTtl = duration + 300; // keep cache alive for sim duration + 5 min buffer
+  await client.set(sessionKey, JSON.stringify(selectedShips), { expiry: { type: TimeUnit.Seconds, count: sessionTtl } });
+
+  // Fan out workers with lightweight payload — just session reference + slice indices
+  const totalShips = selectedShips.length;
   const chunks = [];
-  for (let i = 0; i < selectedShips.length; i += chunkSize) {
-    chunks.push(selectedShips.slice(i, i + chunkSize));
+  for (let i = 0; i < totalShips; i += chunkSize) {
+    chunks.push({ startIndex: i, count: Math.min(chunkSize, totalShips - i) });
   }
 
   const invokePromises = chunks.map((chunk, idx) =>
@@ -701,7 +711,9 @@ async function startSimulation(body) {
       FunctionName: workerArn,
       InvocationType: 'Event',
       Payload: Buffer.from(JSON.stringify({
-        ships: chunk,
+        sessionKey,
+        startIndex: chunk.startIndex,
+        shipCount: chunk.count,
         duration,
         updatePolicy,
         topN,
@@ -714,6 +726,7 @@ async function startSimulation(body) {
 
   return respond(202, {
     message: 'Simulation launched',
+    sessionKey,
     shipCount: selectedShips.length,
     workerCount: chunks.length,
     chunkSize,
@@ -790,26 +803,30 @@ async function startLoadTest(body) {
     allProfiles.push(...generated);
   }
 
-  // Launch all phases with staggered start delays
+  // Cache all profiles in Valkey session for workers to pull from
+  const client = await getClient();
+  const sessionKey = `session:${testId}`;
+  const totalDuration = phases.reduce((sum, p) => sum + p.duration, 0);
+  const sessionTtl = totalDuration + 300;
+  await client.set(sessionKey, JSON.stringify(allProfiles), { expiry: { type: TimeUnit.Seconds, count: sessionTtl } });
+
+  // Launch all phases with staggered start delays — workers reference the session
   const workerArn = process.env.WORKER_LAMBDA_ARN;
   let globalWorkerIdx = 0;
   let phaseStartDelay = 0;
 
   for (let phaseIdx = 0; phaseIdx < phases.length; phaseIdx++) {
     const phase = phases[phaseIdx];
-    const shipsNeeded = phase.writers * phase.shipsPerWriter;
 
-    // Randomly sample ships for this phase
-    const phaseShips = allProfiles.slice(0, shipsNeeded);
-
-    // Chunk into workers
     for (let w = 0; w < phase.writers; w++) {
-      const chunk = phaseShips.slice(w * phase.shipsPerWriter, (w + 1) * phase.shipsPerWriter);
+      const startIndex = w * phase.shipsPerWriter;
       await lambdaClient.send(new InvokeCommand({
         FunctionName: workerArn,
         InvocationType: 'Event',
         Payload: Buffer.from(JSON.stringify({
-          ships: chunk,
+          sessionKey,
+          startIndex,
+          shipCount: phase.shipsPerWriter,
           duration: phase.duration,
           updatePolicy,
           topN: 0,
@@ -828,6 +845,7 @@ async function startLoadTest(body) {
   return respond(202, {
     message: 'Load test started',
     testId,
+    sessionKey,
     phases,
     totalWriters: globalWorkerIdx,
     estimatedDuration: phaseStartDelay,

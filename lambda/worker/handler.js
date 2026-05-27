@@ -70,7 +70,21 @@ exports.handler = async (event) => {
   try {
     const client = await getClient();
 
-    const ships = event.ships || [];
+    // Load ships: either from Valkey session cache (preferred) or directly from event payload (fallback)
+    let ships;
+    if (event.sessionKey) {
+      const raw = await client.get(event.sessionKey);
+      if (!raw) {
+        return { message: 'Session expired or not found', sessionKey: event.sessionKey, shipsSimulated: 0 };
+      }
+      const allShips = JSON.parse(raw);
+      const start = Number(event.startIndex) || 0;
+      const count = Number(event.shipCount) || allShips.length;
+      ships = allShips.slice(start, start + count);
+    } else {
+      ships = event.ships || [];
+    }
+
     if (ships.length === 0) {
       return { message: 'No ships provided', shipsSimulated: 0 };
     }
