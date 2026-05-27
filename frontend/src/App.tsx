@@ -357,6 +357,8 @@ function App() {
         lastLaunchTime={lastLaunchTime}
       />
 
+      {isRunning && <EventFeed isRunning={isRunning} configLoaded={configLoaded} />}
+
       {configError && (
         <div className="error-banner">
           <span>⚠</span>
@@ -521,7 +523,6 @@ function App() {
         </div>
       )}
 
-      <EventFeed isRunning={isRunning} configLoaded={configLoaded} />
     </div>
   );
 }
