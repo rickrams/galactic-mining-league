@@ -103,6 +103,38 @@ The data flow for lifetime stats:
 
 This is the **write-through cache** pattern: DynamoDB is the source of truth for lifetime data, but Valkey serves it on the hot read path. The leaderboard page never calls DynamoDB — it gets everything (name, class, score, rank, lifetime stats) from Valkey in two pipelined calls: `ZRANGEWITHSCORES` + batch `HGETALL`.
 
+### Streams as an Event Log
+
+```
+XADD galactic:events * type sim_start workerId 3 ships 50 duration 30
+XADD galactic:events * type tick workerId 3 tick 12 opsThisTick 150
+XADD galactic:events * type sim_complete workerId 3 totalUpdates 9000 p50 3.2
+```
+
+Workers emit events to a capped Valkey Stream on every lifecycle event (start, tick, complete). The stream auto-trims to ~1000 entries via `MAXLEN ~1000` — approximate trimming is more efficient than exact because Valkey can delete whole radix tree nodes.
+
+The frontend polls incrementally:
+```
+GET /events?since=1779923235915-0&limit=20
+```
+
+Returns only events *after* the given stream ID — no re-reading old data. This is the "consumer polling" pattern: each client tracks its last-read position and fetches forward. In a production system this would be a WebSocket with `XREAD BLOCK`, but the pattern is the same.
+
+Why Streams over Pub/Sub here: Pub/Sub is fire-and-forget — if the subscriber isn't connected when the message is published, it's lost. Streams persist events with automatic IDs, support replay from any point, and allow multiple independent consumers to read at their own pace.
+
+### Ephemeral Session Cache (SET + EX)
+
+```
+SET session:sim-abc123 <JSON array of 2000 profiles> EX 360
+```
+
+When launching a simulation, the API stores the full profile list in Valkey with a TTL. Workers receive only `{sessionKey, startIndex, shipCount}` in their invoke payload (~200 bytes) and `GET` the session key to retrieve their slice. The key auto-expires after the simulation completes.
+
+This solves:
+- **Lambda payload limit** (256KB for async invoke) — 2000 profiles × ~200 bytes each = 400KB, won't fit in a single invoke
+- **Redundant DynamoDB scans** — one scan, one `SET`, N `GET`s
+- **Coordination-free sharing** — workers independently read the same key, slice their own chunk
+
 ## Architecture: Two-Tier Storage
 
 > Full architecture diagrams, sequence flows, and design decisions: [ARCHITECTURE.md](ARCHITECTURE.md)
@@ -220,6 +252,8 @@ npx cdk destroy
 - **Fan-out workers**: up to 200 concurrent Lambda writers hitting the same sorted sets — simulates real multi-tenant write contention
 - **Two-tier storage**: DynamoDB for durable profiles + ElastiCache for hot rankings — the production pattern, not a shortcut
 - **Write-through cache**: lifetime stats flow DynamoDB → Valkey hash on every sim completion, so reads never hit DynamoDB
+- **Event stream**: workers emit lifecycle events to a capped Valkey Stream — frontend consumes incrementally via XRANGE, showing real-time simulation activity
+- **Session caching**: profile data cached in Valkey with TTL for worker fan-out — eliminates Lambda payload limits and redundant DynamoDB scans
 - **Load test harness**: phased ramp-up with per-worker latency percentiles — actually measures ElastiCache Serverless performance characteristics
 - **Pagination + filtering**: handles 10,000+ member sorted sets with offset/limit pagination, ship class filtering, and score thresholds — all combinable
 - **Time windows**: daily/weekly/alltime boards stored as independent sorted sets with historical date browsing

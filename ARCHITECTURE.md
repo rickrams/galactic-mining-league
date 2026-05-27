@@ -83,6 +83,14 @@ graph LR
         H["ship:{shipId}<br/>{shipName, pilotName, shipClass,<br/>totalSimulations, lifetimeOreHauled}"]
     end
 
+    subgraph "Streams — Event Log"
+        S["galactic:events<br/>(capped ~1000 entries)<br/>{type, workerId, tick, opsThisTick, ...}"]
+    end
+
+    subgraph "Strings — Session Cache"
+        K["session:{simId}<br/>JSON array of profiles<br/>(TTL: duration + 5min)"]
+    end
+
     A -->|"HGETALL batch<br/>on read"| H
     B -->|"HGETALL batch"| H
     C -->|"HGETALL batch"| H
@@ -105,6 +113,7 @@ graph LR
 | `POST` | `/ships/{id}/score` | `ZINCRBY` or `ZADD GT` | Manual score update |
 | `POST` | `/simulation/start` | DynamoDB `Scan` + Lambda `Invoke` ×N | Fan-out fleet simulation |
 | `POST` | `/leaderboard/topn` | `ZREMRANGEBYRANK`, `ZCARD` | Prune to top-N |
+| `GET` | `/events?since=&limit=` | `XRANGE`, `XLEN` | Incremental event stream consumption |
 | `POST` | `/loadtest/start` | DynamoDB + Lambda `Invoke` ×N (phased) | Phased load test with ramp-up |
 | `GET` | `/loadtest/{id}` | DynamoDB `Scan` + aggregate | Load test results with latency percentiles |
 | `GET` | `/loadtests` | DynamoDB `Scan` | List all load tests |
@@ -213,6 +222,11 @@ sequenceDiagram
 | **ZCARD** | Total member count per window | Stats cards |
 | **ZREMRANGEBYRANK** | Top-N cap enforcement per tick | Prune to top 10–500 |
 | **HSET / HGETALL** | Metadata + lifetime stats cache (write-through from DynamoDB) | Batch 50–200 per page |
+| **XADD + MAXLEN** | Capped event stream — workers emit tick/start/complete events | ~1000 entries, auto-trimmed |
+| **XRANGE** | Incremental stream reads — frontend polls with exclusive start ID | 20 events/poll, 1s interval |
+| **XLEN** | Stream depth indicator in UI | Live count |
+| **SET + EX** | Ephemeral session cache — profile data shared across workers via TTL key | 2000+ profiles, 5min TTL |
+| **GET** | Workers read session cache to retrieve their ship slice | N concurrent readers, one key |
 | **SCAN** | Safe key enumeration (reset, window discovery) | Pattern: `galactic:leaderboard:*` |
 | **Pipelining (Batch)** | Bulk operations — one round-trip per tick per worker | 150 ops/batch × 100 workers |
 | **TLS** | Encrypted transport (required by ElastiCache Serverless) | All connections |
@@ -265,5 +279,7 @@ galactic-mining-league/
 | Time-windowed keys (daily/weekly/alltime) | Separate sorted sets per window = independent lifecycle, no cross-contamination |
 | `ZADD GT` vs `ZINCRBY` toggle | Demonstrates two common leaderboard patterns (cumulative vs. high-score) in one UI toggle |
 | `ZREMRANGEBYRANK` per tick | Shows real-time pruning under write load |
+| Streams over Pub/Sub for events | Streams persist (replay from any point), Pub/Sub doesn't — Lambda can't hold subscriptions, so polling XRANGE with `since` is the right pattern |
+| Session cache with TTL (SET EX) | Avoids Lambda 256KB payload limit at scale; one Valkey write replaces N copies of profile data in invoke payloads |
 | Phased load test with startDelay | Workers sleep before starting to create a realistic ramp-up curve, measuring where latency degrades |
 | Per-worker latency percentiles via hrtime | Measures actual Valkey pipeline round-trip time (not Lambda overhead) for accurate characterization |
