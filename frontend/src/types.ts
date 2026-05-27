@@ -39,6 +39,26 @@ export interface LeaderboardStats {
   weekly: { shipCount: number; key: string };
 }
 
+export interface StreamEvent {
+  id: string;
+  type: string;
+  workerId?: string;
+  ships?: string;
+  tick?: string;
+  opsThisTick?: string;
+  duration?: string;
+  updatePolicy?: string;
+  totalUpdates?: string;
+  p50?: string;
+}
+
+export interface EventsResponse {
+  events: StreamEvent[];
+  count: number;
+  streamLength: number;
+  lastId: string;
+}
+
 export interface LeaderboardWindows {
   alltime: boolean;
   daily: string[];

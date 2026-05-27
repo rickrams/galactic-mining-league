@@ -128,6 +128,19 @@ exports.handler = async (event) => {
       await client.exec(registerBatch, false);
     }
 
+    // Publish simulation start event
+    await client.xadd(
+      'galactic:events',
+      [
+        ['type', 'sim_start'],
+        ['workerId', String(workerId)],
+        ['ships', String(ships.length)],
+        ['duration', String(duration)],
+        ['updatePolicy', updatePolicy],
+      ],
+      { trim: { method: 'maxlen', threshold: 1000, exact: false } },
+    );
+
     // Mining loop
     const totalTicks = Math.floor((duration * 1000) / tickIntervalMs);
     let totalUpdates = 0;
@@ -171,6 +184,19 @@ exports.handler = async (event) => {
         ]);
       }
 
+      // Publish a tick event to the stream (capped at 1000 entries)
+      await client.xadd(
+        'galactic:events',
+        [
+          ['type', 'tick'],
+          ['workerId', String(workerId)],
+          ['tick', String(tick)],
+          ['ships', String(ships.length)],
+          ['opsThisTick', String(ships.length * 3)],
+        ],
+        { trim: { method: 'maxlen', threshold: 1000, exact: false } },
+      );
+
       const elapsed = Date.now() - tickStart;
       const sleepTime = tickIntervalMs - elapsed;
       if (sleepTime > 0) {
@@ -186,6 +212,19 @@ exports.handler = async (event) => {
     }
 
     console.log(`Worker ${workerId} complete. Ships: ${ships.length}, updates: ${totalUpdates}`);
+
+    // Publish simulation complete event
+    await client.xadd(
+      'galactic:events',
+      [
+        ['type', 'sim_complete'],
+        ['workerId', String(workerId)],
+        ['ships', String(ships.length)],
+        ['totalUpdates', String(totalUpdates)],
+        ['p50', String(computePercentiles(latencies).p50.toFixed(1))],
+      ],
+      { trim: { method: 'maxlen', threshold: 1000, exact: false } },
+    );
 
     // Write load test results if this is part of a load test
     if (event.loadTestId && LOADTEST_TABLE) {

@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import './App.css';
 import Leaderboard from './components/Leaderboard';
 import SimulationControls from './components/SimulationControls';
+import EventFeed from './components/EventFeed';
 import { LeaderboardEntry, LeaderboardStats, LeaderboardWindows, PaginationInfo, SimConfig, TimeWindow } from './types';
 import {
   setApiBaseUrl,
@@ -519,6 +520,8 @@ function App() {
           <button disabled={!pagination.hasMore} onClick={() => setPage(p => p + 1)}>Next →</button>
         </div>
       )}
+
+      <EventFeed isRunning={isRunning} configLoaded={configLoaded} />
     </div>
   );
 }

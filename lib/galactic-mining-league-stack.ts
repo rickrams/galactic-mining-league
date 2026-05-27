@@ -296,6 +296,12 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
       integration: apiIntegration,
     });
 
+    httpApi.addRoutes({
+      path: '/events',
+      methods: [apigatewayv2.HttpMethod.GET],
+      integration: apiIntegration,
+    });
+
     // -------------------------------------------------------------------------
     // S3 bucket for frontend (private, CloudFront OAC access only)
     // -------------------------------------------------------------------------

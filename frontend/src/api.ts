@@ -1,4 +1,4 @@
-import { LeaderboardEntry, LeaderboardStats, LeaderboardWindows, PaginatedLeaderboard, SimConfig, TimeWindow } from './types';
+import { EventsResponse, LeaderboardEntry, LeaderboardStats, LeaderboardWindows, PaginatedLeaderboard, SimConfig, TimeWindow } from './types';
 
 let apiBaseUrl: string = process.env.REACT_APP_API_URL || '';
 
@@ -101,4 +101,15 @@ export async function resetLeaderboard(): Promise<void> {
   if (!response.ok) {
     throw new Error(`Failed to reset leaderboard: ${response.status}`);
   }
+}
+
+export async function getEvents(since?: string): Promise<EventsResponse> {
+  const params = new URLSearchParams();
+  if (since) params.set('since', since);
+  params.set('limit', '20');
+  const response = await fetch(`${apiBaseUrl}/events?${params.toString()}`);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch events: ${response.status}`);
+  }
+  return response.json();
 }

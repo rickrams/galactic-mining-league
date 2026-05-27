@@ -852,6 +852,60 @@ async function startLoadTest(body) {
   });
 }
 
+// GET /events?since={id}&limit=50 — read from the event stream
+async function getEvents(client, queryParams) {
+  const since = (queryParams && queryParams.since) || '0-0';
+  const limit = Math.min(Math.max(1, Number(queryParams?.limit) || 50), 200);
+
+  // XRANGE: get entries after `since` (exclusive — use since as start, then skip first if it matches)
+  // Actually XRANGE is inclusive, so to get "after since" we use the next possible ID
+  const startId = since === '0-0' ? '-' : `(${since}`;
+
+  // GLIDE xrange uses Boundary<string> — InfBoundary.NegativeInfinity for "-"
+  let results;
+  if (since === '0-0') {
+    results = await client.xrange(
+      'galactic:events',
+      InfBoundary.NegativeInfinity,
+      InfBoundary.PositiveInfinity,
+      { count: limit },
+    );
+  } else {
+    // Exclusive start: use the ID format "(id" — GLIDE uses Boundary with isInclusive
+    results = await client.xrange(
+      'galactic:events',
+      { value: since, isInclusive: false },
+      InfBoundary.PositiveInfinity,
+      { count: limit },
+    );
+  }
+
+  // xrange returns Record<string, [GlideString, GlideString][]> | null
+  // Keys are stream entry IDs, values are arrays of [field, value] pairs
+  const events = [];
+  if (results && typeof results === 'object') {
+    const entries = Object.entries(results);
+    for (const [id, fieldPairs] of entries) {
+      const fields = {};
+      if (Array.isArray(fieldPairs)) {
+        for (const pair of fieldPairs) {
+          fields[String(pair[0])] = String(pair[1]);
+        }
+      }
+      events.push({ id: String(id), ...fields });
+    }
+  }
+
+  const streamLen = await client.xlen('galactic:events');
+
+  return respond(200, {
+    events,
+    count: events.length,
+    streamLength: Number(streamLen),
+    lastId: events.length > 0 ? events[events.length - 1].id : since,
+  });
+}
+
 // GET /loadtests — List all load tests
 async function listLoadTests() {
   const result = await ddbClient.send(new ScanCommand({
@@ -1052,6 +1106,10 @@ exports.handler = async (event) => {
       case 'GET /loadtests':
         return await listLoadTests();
 
+      // Event stream
+      case 'GET /events':
+        return await getEvents(client, queryParams);
+
       // Feature 4: explicit top-N pruning endpoint
       case 'POST /leaderboard/topn':
         return await postLeaderboardTopN(client, event.body);
@@ -1070,6 +1128,7 @@ exports.handler = async (event) => {
       case 'OPTIONS /ships/{id}/rank':
       case 'OPTIONS /ships/{id}/score':
       case 'OPTIONS /simulation/start':
+      case 'OPTIONS /events':
       case 'OPTIONS /loadtest/start':
       case 'OPTIONS /loadtest/{id}':
       case 'OPTIONS /loadtests':

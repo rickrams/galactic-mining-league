@@ -909,3 +909,96 @@ body::before {
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.85rem;
 }
+
+/* Event Feed (Valkey Streams) */
+.event-feed {
+  max-width: 900px;
+  margin: 24px auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.event-feed-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.event-feed-title {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.event-feed-badge {
+  font-size: 0.72rem;
+  color: var(--accent-dim);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  background: var(--accent-glow);
+  padding: 2px 8px;
+  border-radius: 8px;
+}
+
+.event-feed-list {
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.event-feed-empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.event-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 16px;
+  font-size: 0.78rem;
+  border-left: 3px solid transparent;
+  transition: background 0.15s;
+}
+
+.event-item:hover {
+  background: var(--bg-row-hover);
+}
+
+.event-item.event-start {
+  border-left-color: var(--success);
+}
+
+.event-item.event-complete {
+  border-left-color: var(--accent);
+}
+
+.event-item.event-tick {
+  border-left-color: var(--text-muted);
+}
+
+.event-id {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  min-width: 130px;
+  flex-shrink: 0;
+}
+
+.event-text {
+  color: var(--text-secondary);
+}
+
+.event-item.event-start .event-text {
+  color: var(--success);
+}
+
+.event-item.event-complete .event-text {
+  color: var(--accent);
+}
