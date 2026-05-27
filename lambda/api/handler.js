@@ -493,15 +493,25 @@ async function getLeaderboardAbove(client, threshold, queryParams) {
 
   const sliced = (allResults || []).slice(offset, offset + limit);
 
-  const entries = sliced.map((entry, i) => {
+  // Enrich with metadata from Valkey hashes
+  let metaResults = [];
+  if (sliced.length > 0) {
+    const metaBatch = new Batch(false);
+    for (const entry of sliced) {
+      metaBatch.hgetall(`ship:${String(entry.element)}`);
+    }
+    metaResults = await client.exec(metaBatch, false) || [];
+  }
 
+  const entries = sliced.map((entry, i) => {
+    const meta = hashToObj(metaResults[i]);
     return {
       rank: offset + i + 1,
       shipId: String(entry.element),
       score: Number(entry.score),
-      shipName: 'Unknown',
-      pilotName: 'Unknown',
-      shipClass: 'Unknown',
+      shipName: meta.shipName || 'Unknown',
+      pilotName: meta.pilotName || 'Unknown',
+      shipClass: meta.shipClass || 'Unknown',
     };
   });
 
