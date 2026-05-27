@@ -468,19 +468,12 @@ async function getLeaderboardAbove(client, threshold, queryParams) {
 
   const window = (queryParams && queryParams.window) || 'alltime';
   const leaderboardKey = resolveWindowKey(window, queryParams);
+  const classFilter = queryParams?.shipClass || null;
 
   const offset = Math.max(0, Number(queryParams?.offset) || 0);
   const limit = Math.min(Math.max(1, Number(queryParams?.limit) || 50), 100);
 
-  // Count ships with score >= threshold
-  const count = await client.zcount(
-    leaderboardKey,
-    { value: parsed, isInclusive: true },
-    InfBoundary.PositiveInfinity,
-  );
-
-  // Fetch entries with score >= threshold, highest first.
-  // With reverse:true, start=high bound and end=low bound (ZREVRANGEBYSCORE semantics).
+  // Fetch all entries with score >= threshold, highest first.
   const allResults = await client.zrangeWithScores(
     leaderboardKey,
     {
@@ -491,31 +484,49 @@ async function getLeaderboardAbove(client, threshold, queryParams) {
     { reverse: true },
   );
 
-  const sliced = (allResults || []).slice(offset, offset + limit);
-
-  // Enrich with metadata from Valkey hashes
-  let metaResults = [];
-  if (sliced.length > 0) {
-    const metaBatch = new Batch(false);
-    for (const entry of sliced) {
-      metaBatch.hgetall(`ship:${String(entry.element)}`);
-    }
-    metaResults = await client.exec(metaBatch, false) || [];
+  if (!allResults || allResults.length === 0) {
+    return respond(200, {
+      count: 0,
+      entries: [],
+      pagination: { offset, limit, count: 0, total: 0, hasMore: false },
+      filter: classFilter ? { shipClass: classFilter, threshold: parsed } : { threshold: parsed },
+    });
   }
 
-  const entries = sliced.map((entry, i) => {
-    const meta = hashToObj(metaResults[i]);
-    return {
-      rank: offset + i + 1,
-      shipId: String(entry.element),
-      score: Number(entry.score),
-      shipName: meta.shipName || 'Unknown',
-      pilotName: meta.pilotName || 'Unknown',
-      shipClass: meta.shipClass || 'Unknown',
-    };
-  });
+  // Enrich all results with metadata (needed for class filtering)
+  // Process in batches of 200 to avoid oversized pipelines
+  const enriched = [];
+  const ENRICH_BATCH = 200;
+  for (let i = 0; i < allResults.length; i += ENRICH_BATCH) {
+    const chunk = allResults.slice(i, i + ENRICH_BATCH);
+    const metaBatch = new Batch(false);
+    for (const entry of chunk) {
+      metaBatch.hgetall(`ship:${String(entry.element)}`);
+    }
+    const metaResults = await client.exec(metaBatch, false) || [];
 
-  const total = Number(count);
+    for (let j = 0; j < chunk.length; j++) {
+      const meta = hashToObj(metaResults[j]);
+      const shipClass = meta.shipClass || 'Unknown';
+      if (!classFilter || shipClass === classFilter) {
+        enriched.push({
+          shipId: String(chunk[j].element),
+          score: Number(chunk[j].score),
+          shipName: meta.shipName || 'Unknown',
+          pilotName: meta.pilotName || 'Unknown',
+          shipClass,
+        });
+      }
+    }
+
+    // Early exit: if we have enough for offset + limit and no class filter, stop
+    if (!classFilter && enriched.length >= offset + limit) break;
+  }
+
+  const total = enriched.length;
+  const page = enriched.slice(offset, offset + limit);
+  const entries = page.map((e, i) => ({ ...e, rank: offset + i + 1 }));
+
   return respond(200, {
     count: total,
     entries,
@@ -526,6 +537,7 @@ async function getLeaderboardAbove(client, threshold, queryParams) {
       total,
       hasMore: offset + entries.length < total,
     },
+    filter: classFilter ? { shipClass: classFilter, threshold: parsed } : { threshold: parsed },
   });
 }
 

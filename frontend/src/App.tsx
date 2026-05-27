@@ -121,7 +121,7 @@ function App() {
     try {
       const [boardData, statsData, windowsData] = await Promise.all([
         threshold !== null
-          ? getAboveThreshold(threshold, window, dateOrWeek).then((r) => {
+          ? getAboveThreshold(threshold, window, dateOrWeek, classFilterRef.current || undefined).then((r) => {
               setFilteredCount(r.count);
               setPagination(null);
               return r.entries;
@@ -253,7 +253,8 @@ function App() {
     setPage(0);
     pageRef.current = 0;
     try {
-      const result = await getAboveThreshold(parsed, activeWindowRef.current);
+      const dateOrWeek = activeWindowRef.current === 'daily' ? selectedDateRef.current || undefined : activeWindowRef.current === 'weekly' ? selectedWeekRef.current || undefined : undefined;
+      const result = await getAboveThreshold(parsed, activeWindowRef.current, dateOrWeek, classFilterRef.current || undefined);
       setEntries(result.entries);
       setFilteredCount(result.count);
       setPagination(null);

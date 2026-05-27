@@ -51,11 +51,13 @@ export async function getAboveThreshold(
   threshold: number,
   window?: TimeWindow,
   dateOrWeek?: string,
+  shipClass?: string,
 ): Promise<{ count: number; entries: LeaderboardEntry[] }> {
   const params = new URLSearchParams();
   if (window) params.set('window', window);
   if (window === 'daily' && dateOrWeek) params.set('date', dateOrWeek);
   if (window === 'weekly' && dateOrWeek) params.set('week', dateOrWeek);
+  if (shipClass) params.set('shipClass', shipClass);
   const url = `${apiBaseUrl}/leaderboard/above/${threshold}${params.toString() ? '?' + params.toString() : ''}`;
   const response = await fetch(url);
   if (!response.ok) {
