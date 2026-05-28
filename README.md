@@ -179,19 +179,37 @@ The p99 tail (~100-140ms) reflects Lambda execution overhead (cold starts, GC pa
 ## Running It
 
 ### Prerequisites
-- AWS account with CDK bootstrapped (`npx cdk bootstrap`)
+- AWS account with CDK bootstrapped in your target region
 - Node.js 22+
-- AWS credentials configured
+- AWS credentials configured (environment variables or `~/.aws/credentials`)
 
 ### Deploy
 
 ```bash
-cd frontend && npm install && npm run build && cd ..
+# Clone
+git clone https://github.com/rickrams/galactic-mining-league.git
+cd galactic-mining-league
+
+# Install dependencies (root CDK + Lambda + frontend)
 npm install
+cd lambda && npm install && cd ..
+cd frontend && npm install && npm run build && cd ..
+
+# Bootstrap CDK if not already done in your region
+npx cdk bootstrap aws://<ACCOUNT_ID>/us-west-2
+
+# Deploy (takes ~5 minutes on first deploy — creates VPC, ElastiCache, DynamoDB, Lambda, etc.)
+export AWS_REGION=us-west-2
 npx cdk deploy
 ```
 
-Outputs the API URL and CloudFront frontend URL.
+Outputs:
+```
+GalacticMiningLeagueStack.ApiUrl = https://xxxxxxxxxx.execute-api.us-west-2.amazonaws.com
+GalacticMiningLeagueStack.FrontendUrl = https://dxxxxxxxxxx.cloudfront.net
+```
+
+Open the `FrontendUrl` in a browser — you're ready to go. The first simulation will auto-generate ship profiles if none exist.
 
 ### Run a Simulation
 
