@@ -12,6 +12,7 @@ import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as cloudfrontorigins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import * as path from 'path';
 
 export class GalacticMiningLeagueStack extends cdk.Stack {
@@ -111,6 +112,7 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
     const workerLambda = new NodejsFunction(this, 'WorkerLambda', {
       functionName: 'galactic-mining-worker',
       runtime: lambda.Runtime.NODEJS_22_X,
+      logRetention: logs.RetentionDays.THREE_DAYS,
       entry: path.join(__dirname, '../lambda/worker/handler.js'),
       handler: 'handler',
       depsLockFilePath: path.join(__dirname, '../lambda/package-lock.json'),
@@ -137,6 +139,7 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
     const apiLambda = new NodejsFunction(this, 'ApiLambda', {
       functionName: 'galactic-mining-api',
       runtime: lambda.Runtime.NODEJS_22_X,
+      logRetention: logs.RetentionDays.THREE_DAYS,
       entry: path.join(__dirname, '../lambda/api/handler.js'),
       handler: 'handler',
       depsLockFilePath: path.join(__dirname, '../lambda/package-lock.json'),
