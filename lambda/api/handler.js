@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
-const { GlideClusterClient, Batch, InfBoundary, UpdateByScore, TimeUnit } = require('@valkey/valkey-glide');
+const { GlideClusterClient, ClusterScanCursor, Batch, InfBoundary, UpdateByScore, TimeUnit } = require('@valkey/valkey-glide');
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 
 // ---------------------------------------------------------------------------
@@ -163,21 +163,22 @@ async function applyTopNCap(client, topN) {
 // GET /ships — list all ship profiles by scanning ship:* keys
 async function listShipProfiles(client) {
   const profiles = [];
-  let cursor = '0';
-  do {
+  let cursor = new ClusterScanCursor();
+  while (!cursor.isFinished()) {
     const [nextCursor, keys] = await client.scan(cursor, { match: 'ship:*', count: 200 });
     cursor = nextCursor;
     if (keys.length > 0) {
+      const keyStrs = keys.map(k => String(k));
       const batch = new Batch(false);
-      for (const key of keys) {
+      for (const key of keyStrs) {
         batch.hgetall(key);
       }
       const results = await client.exec(batch, false);
-      for (let i = 0; i < keys.length; i++) {
+      for (let i = 0; i < keyStrs.length; i++) {
         const meta = hashToObj(results && results[i]);
         if (meta.shipName) {
           profiles.push({
-            shipId: keys[i].replace('ship:', ''),
+            shipId: keyStrs[i].replace('ship:', ''),
             shipName: meta.shipName,
             pilotName: meta.pilotName || 'Unknown',
             shipClass: meta.shipClass || 'Unknown',
@@ -189,7 +190,7 @@ async function listShipProfiles(client) {
         }
       }
     }
-  } while (cursor !== '0');
+  }
   return respond(200, profiles);
 }
 
@@ -420,25 +421,25 @@ async function getLeaderboardWindows(client) {
   const dailyDates = [];
   const weeklyWeeks = [];
 
-  let cursor = '0';
-  do {
+  let cursor = new ClusterScanCursor();
+  while (!cursor.isFinished()) {
     const [nextCursor, keys] = await client.scan(cursor, { match: 'galactic:leaderboard:daily:*', count: 100 });
     cursor = nextCursor;
     for (const key of keys) {
-      const date = key.replace('galactic:leaderboard:daily:', '');
+      const date = String(key).replace('galactic:leaderboard:daily:', '');
       dailyDates.push(date);
     }
-  } while (cursor !== '0');
+  }
 
-  cursor = '0';
-  do {
+  cursor = new ClusterScanCursor();
+  while (!cursor.isFinished()) {
     const [nextCursor, keys] = await client.scan(cursor, { match: 'galactic:leaderboard:weekly:*', count: 100 });
     cursor = nextCursor;
     for (const key of keys) {
-      const week = key.replace('galactic:leaderboard:weekly:', '');
+      const week = String(key).replace('galactic:leaderboard:weekly:', '');
       weeklyWeeks.push(week);
     }
-  } while (cursor !== '0');
+  }
 
   dailyDates.sort().reverse();
   weeklyWeeks.sort().reverse();
@@ -639,21 +640,22 @@ async function startSimulation(client, body) {
 
   // Load ship profiles from Valkey hashes
   let allProfiles = [];
-  let cursor = '0';
-  do {
+  let cursor = new ClusterScanCursor();
+  while (!cursor.isFinished()) {
     const [nextCursor, keys] = await client.scan(cursor, { match: 'ship:*', count: 200 });
     cursor = nextCursor;
     if (keys.length > 0) {
+      const keyStrs = keys.map(k => String(k));
       const batch = new Batch(false);
-      for (const key of keys) {
+      for (const key of keyStrs) {
         batch.hgetall(key);
       }
       const results = await client.exec(batch, false);
-      for (let i = 0; i < keys.length; i++) {
+      for (let i = 0; i < keyStrs.length; i++) {
         const meta = hashToObj(results && results[i]);
         if (meta.shipName) {
           allProfiles.push({
-            shipId: keys[i].replace('ship:', ''),
+            shipId: keyStrs[i].replace('ship:', ''),
             shipName: meta.shipName,
             pilotName: meta.pilotName || 'Unknown',
             shipClass: meta.shipClass || 'Unknown',
@@ -661,7 +663,7 @@ async function startSimulation(client, body) {
         }
       }
     }
-  } while (cursor !== '0');
+  }
 
   // If not enough profiles, auto-generate to meet the requested count
   if (allProfiles.length < shipCount) {
@@ -794,21 +796,22 @@ async function startLoadTest(client, body) {
   const maxShips = phases.reduce((max, p) => Math.max(max, p.writers * p.shipsPerWriter), 0);
 
   let allProfiles = [];
-  let cursor = '0';
-  do {
+  let cursor = new ClusterScanCursor();
+  while (!cursor.isFinished()) {
     const [nextCursor, keys] = await client.scan(cursor, { match: 'ship:*', count: 200 });
     cursor = nextCursor;
     if (keys.length > 0) {
+      const keyStrs = keys.map(k => String(k));
       const batch = new Batch(false);
-      for (const key of keys) {
+      for (const key of keyStrs) {
         batch.hgetall(key);
       }
       const results = await client.exec(batch, false);
-      for (let i = 0; i < keys.length; i++) {
+      for (let i = 0; i < keyStrs.length; i++) {
         const meta = hashToObj(results && results[i]);
         if (meta.shipName) {
           allProfiles.push({
-            shipId: keys[i].replace('ship:', ''),
+            shipId: keyStrs[i].replace('ship:', ''),
             shipName: meta.shipName,
             pilotName: meta.pilotName || 'Unknown',
             shipClass: meta.shipClass || 'Unknown',
@@ -816,7 +819,7 @@ async function startLoadTest(client, body) {
         }
       }
     }
-  } while (cursor !== '0');
+  }
 
   // Auto-generate if needed
   if (allProfiles.length < maxShips) {
@@ -1092,32 +1095,32 @@ async function resetLeaderboard(client) {
   await client.del([getDailyKey()]);
   await client.del([getWeeklyKey()]);
 
-  let cursor = '0';
-  do {
+  let cursor = new ClusterScanCursor();
+  while (!cursor.isFinished()) {
     const [nextCursor, keys] = await client.scan(cursor, { match: 'galactic:leaderboard:daily:*', count: 100 });
     cursor = nextCursor;
     for (const key of keys) {
-      await client.del([key]);
+      await client.del([String(key)]);
     }
-  } while (cursor !== '0');
+  }
 
-  cursor = '0';
-  do {
+  cursor = new ClusterScanCursor();
+  while (!cursor.isFinished()) {
     const [nextCursor, keys] = await client.scan(cursor, { match: 'galactic:leaderboard:weekly:*', count: 100 });
     cursor = nextCursor;
     for (const key of keys) {
-      await client.del([key]);
+      await client.del([String(key)]);
     }
-  } while (cursor !== '0');
+  }
 
-  cursor = '0';
-  do {
+  cursor = new ClusterScanCursor();
+  while (!cursor.isFinished()) {
     const [nextCursor, keys] = await client.scan(cursor, { match: 'ship:*', count: 100 });
     cursor = nextCursor;
     for (const key of keys) {
-      await client.del([key]);
+      await client.del([String(key)]);
     }
-  } while (cursor !== '0');
+  }
 
   return respond(200, { message: 'Leaderboard reset' });
 }
