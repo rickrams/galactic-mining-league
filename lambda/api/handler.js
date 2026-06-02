@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
-const { GlideClient, Batch, InfBoundary, UpdateByScore, TimeUnit } = require('@valkey/valkey-glide');
+const { GlideClusterClient, Batch, InfBoundary, UpdateByScore, TimeUnit } = require('@valkey/valkey-glide');
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 
 // ---------------------------------------------------------------------------
@@ -14,7 +14,7 @@ let clientPromise = null;
 function getClient() {
   if (!clientPromise) {
     const [host, port] = process.env.VALKEY_ENDPOINT.split(':');
-    clientPromise = GlideClient.createClient({
+    clientPromise = GlideClusterClient.createClient({
       addresses: [{ host, port: Number(port) || 6379 }],
       useTLS: true,
     });

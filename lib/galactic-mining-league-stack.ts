@@ -90,12 +90,12 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
       transitEncryptionEnabled: true,
       atRestEncryptionEnabled: true,
       dataTieringEnabled: false,
-      clusterMode: 'disabled',
+      clusterMode: 'enabled',
     });
     valkeyCluster.addDependency(subnetGroup);
     valkeyCluster.addPropertyOverride('Durability', 'sync');
 
-    const valkeyEndpoint = `${valkeyCluster.attrPrimaryEndPointAddress}:${valkeyCluster.attrPrimaryEndPointPort}`;
+    const valkeyEndpoint = `${valkeyCluster.attrConfigurationEndPointAddress}:${valkeyCluster.attrConfigurationEndPointPort}`;
 
     // -------------------------------------------------------------------------
     // Lambda: worker

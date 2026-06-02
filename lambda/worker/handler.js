@@ -1,13 +1,13 @@
 'use strict';
 
-const { GlideClient, Batch, ConditionalChange, UpdateByScore } = require('@valkey/valkey-glide');
+const { GlideClusterClient, Batch, ConditionalChange, UpdateByScore } = require('@valkey/valkey-glide');
 
 let clientPromise = null;
 
 function getClient() {
   if (!clientPromise) {
     const [host, port] = process.env.VALKEY_ENDPOINT.split(':');
-    clientPromise = GlideClient.createClient({
+    clientPromise = GlideClusterClient.createClient({
       addresses: [{ host, port: Number(port) || 6379 }],
       useTLS: true,
     });
