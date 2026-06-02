@@ -6,7 +6,6 @@ import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as elasticache from 'aws-cdk-lib/aws-elasticache';
 import * as apigatewayv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as apigatewayv2integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
-import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
@@ -35,12 +34,8 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
     });
 
     // -------------------------------------------------------------------------
-    // VPC Endpoints — keep DynamoDB traffic off the NAT gateway
+    // VPC Endpoints — Lambda PrivateLink for fan-out invocation
     // -------------------------------------------------------------------------
-    vpc.addGatewayEndpoint('DynamoDbEndpoint', {
-      service: ec2.GatewayVpcEndpointAwsService.DYNAMODB,
-    });
-
     vpc.addInterfaceEndpoint('LambdaEndpoint', {
       service: ec2.InterfaceVpcEndpointAwsService.LAMBDA,
       privateDnsEnabled: true,
@@ -57,7 +52,7 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
 
     const valkeySg = new ec2.SecurityGroup(this, 'ValkeySg', {
       vpc,
-      description: 'Security group for ElastiCache Valkey Serverless',
+      description: 'Security group for ElastiCache Valkey cluster',
       allowAllOutbound: false,
     });
 
@@ -65,46 +60,43 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
     lambdaSg.addEgressRule(valkeySg, ec2.Port.tcp(6379), 'Lambda to Valkey');
     valkeySg.addIngressRule(lambdaSg, ec2.Port.tcp(6379), 'Valkey from Lambda');
 
-    // Lambda → VPC Endpoints (DynamoDB gateway + Lambda PrivateLink) via HTTPS
+    // Lambda → VPC Endpoints (Lambda PrivateLink) via HTTPS
     lambdaSg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'Lambda to VPC endpoints (HTTPS)');
 
     // -------------------------------------------------------------------------
-    // ElastiCache Valkey Serverless
+    // ElastiCache Valkey 9.0 (node-based, Multi-AZ, synchronous durability)
     // -------------------------------------------------------------------------
-    const privateSubnetIds = vpc.selectSubnets({
+    const privateSubnets = vpc.selectSubnets({
       subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
-    }).subnetIds;
+    });
 
-    const valkeyCache = new elasticache.CfnServerlessCache(this, 'ValkeyCache', {
-      serverlessCacheName: 'galactic-mining',
+    const subnetGroup = new elasticache.CfnSubnetGroup(this, 'ValkeySubnetGroup', {
+      description: 'Subnet group for Galactic Mining Valkey cluster',
+      subnetIds: privateSubnets.subnetIds,
+      cacheSubnetGroupName: 'galactic-mining-subnets',
+    });
+
+    const valkeyCluster = new elasticache.CfnReplicationGroup(this, 'ValkeyCluster', {
+      replicationGroupDescription: 'Galactic Mining League durable Valkey cluster',
       engine: 'valkey',
-      subnetIds: privateSubnetIds,
+      engineVersion: '9.0',
+      cacheNodeType: 'cache.r7g.large',
+      numNodeGroups: 1,
+      replicasPerNodeGroup: 1,
+      multiAzEnabled: true,
+      automaticFailoverEnabled: true,
+      cacheSubnetGroupName: subnetGroup.cacheSubnetGroupName,
       securityGroupIds: [valkeySg.securityGroupId],
+      transitEncryptionEnabled: true,
+      atRestEncryptionEnabled: true,
+      dataTieringEnabled: false,
+      clusterMode: 'disabled',
     });
+    valkeyCluster.addDependency(subnetGroup);
+    // NOTE: Enable synchronous durability via console or CLI once CloudFormation
+    // support lands (feature announced 2026-06-02, CFN property not yet available)
 
-    // TLS endpoint: host:port
-    const valkeyEndpoint = `${valkeyCache.attrEndpointAddress}:${valkeyCache.attrEndpointPort}`;
-
-    // -------------------------------------------------------------------------
-    // DynamoDB: Ship Profiles (durable identity store)
-    // -------------------------------------------------------------------------
-    const profilesTable = new dynamodb.Table(this, 'ProfilesTable', {
-      tableName: 'GalacticMiningProfiles',
-      partitionKey: { name: 'shipId', type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-    });
-
-    // -------------------------------------------------------------------------
-    // DynamoDB: Load Test Results
-    // -------------------------------------------------------------------------
-    const loadTestTable = new dynamodb.Table(this, 'LoadTestTable', {
-      tableName: 'GalacticMiningLoadTests',
-      partitionKey: { name: 'testId', type: dynamodb.AttributeType.STRING },
-      sortKey: { name: 'recordType', type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-    });
+    const valkeyEndpoint = `${valkeyCluster.attrPrimaryEndPointAddress}:${valkeyCluster.attrPrimaryEndPointPort}`;
 
     // -------------------------------------------------------------------------
     // Lambda: worker
@@ -128,8 +120,6 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
       memorySize: 256,
       environment: {
         VALKEY_ENDPOINT: valkeyEndpoint,
-        PROFILES_TABLE: profilesTable.tableName,
-        LOADTEST_TABLE: loadTestTable.tableName,
       },
     });
 
@@ -156,8 +146,6 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
       environment: {
         VALKEY_ENDPOINT: valkeyEndpoint,
         WORKER_LAMBDA_ARN: workerLambda.functionArn,
-        PROFILES_TABLE: profilesTable.tableName,
-        LOADTEST_TABLE: loadTestTable.tableName,
       },
     });
 
@@ -168,12 +156,6 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
         resources: [workerLambda.functionArn],
       }),
     );
-
-    // Grant DynamoDB access to both Lambdas
-    profilesTable.grantReadWriteData(apiLambda);
-    profilesTable.grantReadWriteData(workerLambda);
-    loadTestTable.grantReadWriteData(apiLambda);
-    loadTestTable.grantReadWriteData(workerLambda);
 
     // -------------------------------------------------------------------------
     // API Gateway HTTP API

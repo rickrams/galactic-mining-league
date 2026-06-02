@@ -1,12 +1,6 @@
 'use strict';
 
 const { GlideClient, Batch, ConditionalChange, UpdateByScore } = require('@valkey/valkey-glide');
-const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, UpdateCommand, PutCommand } = require('@aws-sdk/lib-dynamodb');
-
-const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
-const PROFILES_TABLE = process.env.PROFILES_TABLE;
-const LOADTEST_TABLE = process.env.LOADTEST_TABLE;
 
 let clientPromise = null;
 
@@ -56,15 +50,6 @@ function sleep(ms) {
 
 // ---------------------------------------------------------------------------
 // Main handler
-//
-// Event shape:
-// {
-//   ships: [{shipId, shipName, pilotName, shipClass}, ...],  // pre-sliced chunk
-//   duration: 60,
-//   updatePolicy: "cumulative" | "best",
-//   topN: 0,
-//   workerId: 3   // for logging
-// }
 // ---------------------------------------------------------------------------
 exports.handler = async (event) => {
   try {
@@ -109,7 +94,6 @@ exports.handler = async (event) => {
     const weeklyKey  = getWeeklyKey();
 
     // Registration: write metadata to Valkey hash + ZADD NX to all 3 sorted sets
-    // Batch in chunks of 100 to avoid oversized pipelines
     const BATCH_SIZE = 100;
     for (let i = 0; i < ships.length; i += BATCH_SIZE) {
       const chunk = ships.slice(i, i + BATCH_SIZE);
@@ -152,7 +136,6 @@ exports.handler = async (event) => {
     for (let tick = 0; tick < totalTicks; tick++) {
       const tickStart = Date.now();
 
-      // Batch tick updates in chunks to keep pipeline size reasonable
       for (let i = 0; i < ships.length; i += BATCH_SIZE) {
         const chunk = ships.slice(i, i + BATCH_SIZE);
         const tickBatch = new Batch(false);
@@ -172,7 +155,7 @@ exports.handler = async (event) => {
         }
         const t0 = process.hrtime.bigint();
         await client.exec(tickBatch, false);
-        const elapsed = Number(process.hrtime.bigint() - t0) / 1e6; // ms
+        const elapsed = Number(process.hrtime.bigint() - t0) / 1e6;
         latencies.push(elapsed);
       }
 
@@ -184,7 +167,6 @@ exports.handler = async (event) => {
         ]);
       }
 
-      // Publish a tick event to the stream (capped at 1000 entries)
       await client.xadd(
         'galactic:events',
         [
@@ -204,7 +186,6 @@ exports.handler = async (event) => {
       }
     }
 
-    // Compute latency percentiles
     function computePercentiles(arr) {
       const sorted = [...arr].sort((a, b) => a - b);
       const p = (pct) => sorted[Math.floor(pct / 100 * sorted.length)] || 0;
@@ -226,64 +207,33 @@ exports.handler = async (event) => {
       { trim: { method: 'maxlen', threshold: 1000, exact: false } },
     );
 
-    // Write load test results if this is part of a load test
-    if (event.loadTestId && LOADTEST_TABLE) {
-      await ddbClient.send(new PutCommand({
-        TableName: LOADTEST_TABLE,
-        Item: {
-          testId: event.loadTestId,
-          recordType: `worker-${workerId}`,
-          workerId,
-          shipCount: ships.length,
-          totalUpdates,
-          duration,
-          tickInterval: tickIntervalMs,
-          latencyMs: computePercentiles(latencies),
-          opsPerSecond: Math.round(totalUpdates / duration),
-          errors: 0,
-          phase: event.phase !== undefined ? event.phase : null,
-          completedAt: new Date().toISOString(),
-        },
-      }));
+    // Write load test results to Valkey if this is part of a load test
+    if (event.loadTestId) {
+      const percentilesData = computePercentiles(latencies);
+      await client.hset(`loadtest:${event.loadTestId}:worker:${workerId}`, {
+        workerId: String(workerId),
+        shipCount: String(ships.length),
+        totalUpdates: String(totalUpdates),
+        duration: String(duration),
+        tickInterval: String(tickIntervalMs),
+        latencyMs: JSON.stringify(percentilesData),
+        opsPerSecond: String(Math.round(totalUpdates / duration)),
+        phase: String(event.phase !== undefined ? event.phase : null),
+        completedAt: new Date().toISOString(),
+      });
+      // Register worker in the test's worker index
+      await client.zadd(`loadtest:${event.loadTestId}:workers`, [{ element: String(workerId), score: workerId }]);
     }
 
-    // Update DynamoDB profiles and sync lifetime stats to Valkey hash
-    if (PROFILES_TABLE) {
-      const now = new Date().toISOString();
-      const DDB_BATCH = 25;
-      for (let i = 0; i < ships.length; i += DDB_BATCH) {
-        const chunk = ships.slice(i, i + DDB_BATCH);
-        const ddbResults = await Promise.all(chunk.map(ship =>
-          ddbClient.send(new UpdateCommand({
-            TableName: PROFILES_TABLE,
-            Key: { shipId: ship.shipId },
-            UpdateExpression: 'SET lastActiveAt = :now ADD totalSimulations :one, lifetimeOreHauled :ore',
-            ExpressionAttributeValues: {
-              ':now': now,
-              ':one': 1,
-              ':ore': oreEarned[ship.shipId] || 0,
-            },
-            ReturnValues: 'ALL_NEW',
-          })).catch(err => { console.warn(`DDB update failed for ${ship.shipId}:`, err.message); return null; })
-        ));
-
-        // Sync lifetime stats to Valkey hash for leaderboard enrichment
-        const hashBatch = new Batch(false);
-        for (let j = 0; j < chunk.length; j++) {
-          const result = ddbResults[j];
-          if (result && result.Attributes) {
-            const attrs = result.Attributes;
-            hashBatch.hset(`ship:${chunk[j].shipId}`, {
-              shipName: attrs.shipName || chunk[j].shipName,
-              pilotName: attrs.pilotName || chunk[j].pilotName,
-              shipClass: attrs.shipClass || chunk[j].shipClass,
-              totalSimulations: String(attrs.totalSimulations || 0),
-              lifetimeOreHauled: String(attrs.lifetimeOreHauled || 0),
-            });
-          }
-        }
-        await client.exec(hashBatch, false);
-      }
+    // Update lifetime stats directly in Valkey hash (durable with ElastiCache durability)
+    const now = new Date().toISOString();
+    for (let i = 0; i < ships.length; i += BATCH_SIZE) {
+      const chunk = ships.slice(i, i + BATCH_SIZE);
+      await Promise.all(chunk.map(async (ship) => {
+        await client.hincrBy(`ship:${ship.shipId}`, 'totalSimulations', 1);
+        await client.hincrBy(`ship:${ship.shipId}`, 'lifetimeOreHauled', oreEarned[ship.shipId] || 0);
+        await client.hset(`ship:${ship.shipId}`, { lastActiveAt: now });
+      }));
     }
 
     return {
@@ -293,7 +243,6 @@ exports.handler = async (event) => {
       totalUpdates,
       updatePolicy,
       topN,
-      profilesUpdated: PROFILES_TABLE ? ships.length : 0,
       keys: { alltime: alltimeKey, daily: dailyKey, weekly: weeklyKey },
     };
   } catch (err) {

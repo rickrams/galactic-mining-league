@@ -3,12 +3,6 @@
 const crypto = require('crypto');
 const { GlideClient, Batch, InfBoundary, UpdateByScore, TimeUnit } = require('@valkey/valkey-glide');
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
-const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, ScanCommand, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
-
-const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
-const PROFILES_TABLE = process.env.PROFILES_TABLE;
-const LOADTEST_TABLE = process.env.LOADTEST_TABLE;
 
 // ---------------------------------------------------------------------------
 // Valkey GLIDE client — module-level, created lazily and reused across
@@ -105,8 +99,6 @@ function respond(statusCode, body) {
   return { statusCode, headers: CORS_HEADERS, body: JSON.stringify(body) };
 }
 
-// hgetall in GLIDE returns {field, value}[] (direct) or {key, value}[] (batch).
-// Handle both shapes and coerce to string.
 function hashToObj(raw) {
   if (!raw || !Array.isArray(raw) || raw.length === 0) return {};
   return Object.fromEntries(raw.map((f) => [String(f.field || f.key), String(f.value)]));
@@ -116,13 +108,11 @@ function hashToObj(raw) {
 // Feature 1: Time-windowed leaderboard key helpers
 // ---------------------------------------------------------------------------
 
-/** Returns the key for today's daily leaderboard (UTC date). */
 function getDailyKey() {
   const d = new Date();
   return `galactic:leaderboard:daily:${d.toISOString().slice(0, 10)}`;
 }
 
-/** Returns the key for the current ISO week leaderboard. */
 function getWeeklyKey() {
   const d = new Date();
   const jan1 = new Date(d.getUTCFullYear(), 0, 1);
@@ -132,12 +122,6 @@ function getWeeklyKey() {
 
 const ALLTIME_KEY = 'galactic:leaderboard:alltime';
 
-/**
- * Resolve which leaderboard key to query based on query params.
- * ?window=daily|weekly|alltime
- * ?date=YYYY-MM-DD   (for daily — defaults to today)
- * ?week=YYYY-Wnn     (for weekly — defaults to current week)
- */
 function resolveWindowKey(window, queryParams) {
   if (window === 'daily') {
     const date = queryParams && queryParams.date;
@@ -157,20 +141,14 @@ function resolveWindowKey(window, queryParams) {
 }
 
 // ---------------------------------------------------------------------------
-// Feature 4: Top-N cap helper — prune all three windows after a write batch
+// Feature 4: Top-N cap helper
 // ---------------------------------------------------------------------------
 
-/**
- * If topN > 0, remove all entries ranked topN and below (0-based) from each
- * of the three window keys.  Pruning is best-effort — errors are logged but
- * do not fail the parent operation.
- */
 async function applyTopNCap(client, topN) {
   if (!topN || topN <= 0) return;
   const keys = [ALLTIME_KEY, getDailyKey(), getWeeklyKey()];
   for (const key of keys) {
     try {
-      // Keep ranks 0 … topN-1 (the top N).  Remove topN … end.
       await client.zremRangeByRank(key, topN, -1);
     } catch (err) {
       console.warn(`applyTopNCap: failed to prune ${key}:`, err.message);
@@ -179,27 +157,62 @@ async function applyTopNCap(client, topN) {
 }
 
 // ---------------------------------------------------------------------------
-// Route handlers — DynamoDB Ship Profiles
+// Route handlers — Ship Profiles (stored durably in Valkey hashes)
 // ---------------------------------------------------------------------------
 
-// GET /ships — list all ship profiles from DynamoDB
-async function listShipProfiles() {
-  const result = await ddbClient.send(new ScanCommand({ TableName: PROFILES_TABLE }));
-  return respond(200, result.Items || []);
+// GET /ships — list all ship profiles by scanning ship:* keys
+async function listShipProfiles(client) {
+  const profiles = [];
+  let cursor = '0';
+  do {
+    const [nextCursor, keys] = await client.scan(cursor, { match: 'ship:*', count: 200 });
+    cursor = nextCursor;
+    if (keys.length > 0) {
+      const batch = new Batch(false);
+      for (const key of keys) {
+        batch.hgetall(key);
+      }
+      const results = await client.exec(batch, false);
+      for (let i = 0; i < keys.length; i++) {
+        const meta = hashToObj(results && results[i]);
+        if (meta.shipName) {
+          profiles.push({
+            shipId: keys[i].replace('ship:', ''),
+            shipName: meta.shipName,
+            pilotName: meta.pilotName || 'Unknown',
+            shipClass: meta.shipClass || 'Unknown',
+            createdAt: meta.createdAt || null,
+            lastActiveAt: meta.lastActiveAt || null,
+            totalSimulations: Number(meta.totalSimulations) || 0,
+            lifetimeOreHauled: Number(meta.lifetimeOreHauled) || 0,
+          });
+        }
+      }
+    }
+  } while (cursor !== '0');
+  return respond(200, profiles);
 }
 
 // GET /ships/{id} — get single profile with current leaderboard position
 async function getShipProfile(client, shipId) {
-  const [ddbResult, rankRaw, scoreRaw] = await Promise.all([
-    ddbClient.send(new GetCommand({ TableName: PROFILES_TABLE, Key: { shipId } })),
+  const [rawMeta, rankRaw, scoreRaw] = await Promise.all([
+    client.hgetall(`ship:${shipId}`),
     client.zrevrank('galactic:leaderboard:alltime', shipId),
     client.zscore('galactic:leaderboard:alltime', shipId),
   ]);
-  if (!ddbResult.Item) {
+  const meta = hashToObj(rawMeta);
+  if (!meta.shipName) {
     return respond(404, { message: `Ship ${shipId} not found` });
   }
   return respond(200, {
-    ...ddbResult.Item,
+    shipId,
+    shipName: meta.shipName,
+    pilotName: meta.pilotName || 'Unknown',
+    shipClass: meta.shipClass || 'Unknown',
+    createdAt: meta.createdAt || null,
+    lastActiveAt: meta.lastActiveAt || null,
+    totalSimulations: Number(meta.totalSimulations) || 0,
+    lifetimeOreHauled: Number(meta.lifetimeOreHauled) || 0,
     currentRank: rankRaw !== null ? Number(rankRaw) + 1 : null,
     currentScore: scoreRaw !== null ? Number(scoreRaw) : null,
   });
@@ -216,31 +229,27 @@ async function createShipProfile(client, body) {
   }
 
   const now = new Date().toISOString();
-  const item = { shipId, shipName, pilotName, shipClass, createdAt: now, lastActiveAt: now, totalSimulations: 0, lifetimeOreHauled: 0 };
+  const item = { shipId, shipName, pilotName, shipClass, createdAt: now, lastActiveAt: now, totalSimulations: '0', lifetimeOreHauled: '0' };
 
-  await ddbClient.send(new PutCommand({ TableName: PROFILES_TABLE, Item: item }));
-  // Cache in Valkey for fast leaderboard enrichment
-  await client.hset(`ship:${shipId}`, { shipName, pilotName, shipClass });
+  await client.hset(`ship:${shipId}`, {
+    shipName, pilotName, shipClass,
+    createdAt: now, lastActiveAt: now,
+    totalSimulations: '0', lifetimeOreHauled: '0',
+  });
 
-  return respond(201, item);
+  return respond(201, { ...item, totalSimulations: 0, lifetimeOreHauled: 0 });
 }
 
-// POST /ships/seed — bulk-seed all 20 ships from SEED_FLEET into DynamoDB
+// POST /ships/seed — bulk-seed all 20 ships from SEED_FLEET
 async function seedShipProfiles(client) {
   const now = new Date().toISOString();
-  // DynamoDB BatchWrite (max 25 items per batch — we have 20 so one batch is fine)
-  const items = SEED_FLEET.map(s => ({
-    PutRequest: {
-      Item: { shipId: s.id, shipName: s.shipName, pilotName: s.pilotName, shipClass: s.shipClass, createdAt: now, lastActiveAt: now, totalSimulations: 0, lifetimeOreHauled: 0 }
-    }
-  }));
-
-  await ddbClient.send(new BatchWriteCommand({ RequestItems: { [PROFILES_TABLE]: items } }));
-
-  // Also cache all in Valkey
   const batch = new Batch(false);
   for (const s of SEED_FLEET) {
-    batch.hset(`ship:${s.id}`, { shipName: s.shipName, pilotName: s.pilotName, shipClass: s.shipClass });
+    batch.hset(`ship:${s.id}`, {
+      shipName: s.shipName, pilotName: s.pilotName, shipClass: s.shipClass,
+      createdAt: now, lastActiveAt: now,
+      totalSimulations: '0', lifetimeOreHauled: '0',
+    });
   }
   await client.exec(batch, false);
 
@@ -248,7 +257,7 @@ async function seedShipProfiles(client) {
 }
 
 // POST /ships/generate — bulk-create N synthetic ship profiles
-async function generateShipProfiles(body) {
+async function generateShipProfiles(client, body) {
   let parsed;
   try {
     parsed = typeof body === 'string' ? JSON.parse(body || '{}') : (body || {});
@@ -257,20 +266,23 @@ async function generateShipProfiles(body) {
   }
 
   const count = Math.min(Math.max(Number(parsed.count) || 100, 1), 5000);
-
   const profiles = [];
   for (let i = 0; i < count; i++) {
     profiles.push(generateProfile());
   }
 
-  // BatchWrite in groups of 25
-  for (let i = 0; i < profiles.length; i += 25) {
-    const batch = profiles.slice(i, i + 25).map(p => ({
-      PutRequest: { Item: p },
-    }));
-    await ddbClient.send(new BatchWriteCommand({
-      RequestItems: { [PROFILES_TABLE]: batch },
-    }));
+  // Write in batches of 100
+  for (let i = 0; i < profiles.length; i += 100) {
+    const chunk = profiles.slice(i, i + 100);
+    const batch = new Batch(false);
+    for (const p of chunk) {
+      batch.hset(`ship:${p.shipId}`, {
+        shipName: p.shipName, pilotName: p.pilotName, shipClass: p.shipClass,
+        createdAt: p.createdAt, lastActiveAt: p.lastActiveAt,
+        totalSimulations: '0', lifetimeOreHauled: '0',
+      });
+    }
+    await client.exec(batch, false);
   }
 
   return respond(200, {
@@ -304,7 +316,6 @@ async function getLeaderboard(client, queryParams) {
     });
   }
 
-  // Without class filter: simple range query
   if (!classFilter) {
     const results = await client.zrangeWithScores(
       leaderboardKey, { start: offset, end: offset + limit - 1 }, { reverse: true },
@@ -327,7 +338,7 @@ async function getLeaderboard(client, queryParams) {
     const entries = results.map((entry, i) => {
       const shipId = String(entry.element);
       const meta = hashToObj(metaResults && metaResults[i]);
-  
+
       return {
         rank: offset + i + 1,
         shipId,
@@ -347,8 +358,7 @@ async function getLeaderboard(client, queryParams) {
     });
   }
 
-  // With class filter: scan in batches of 200, collect matches until we have
-  // enough to fill offset + limit, then slice.
+  // With class filter: scan in batches of 200, collect matches
   const needed = offset + limit;
   const SCAN_BATCH = 200;
   let cursor = 0;
@@ -370,7 +380,7 @@ async function getLeaderboard(client, queryParams) {
     for (let i = 0; i < results.length; i++) {
       const meta = hashToObj(metaResults && metaResults[i]);
       const shipId = String(results[i].element);
-  
+
       const shipClass = meta.shipClass || 'Unknown';
       if (shipClass === classFilter) {
         filtered.push({
@@ -385,8 +395,6 @@ async function getLeaderboard(client, queryParams) {
     cursor += results.length;
   }
 
-  // We may not have scanned the entire set, so filteredTotal is approximate
-  // unless we scanned everything
   const scannedAll = cursor >= totalAll;
   const filteredTotal = scannedAll ? filtered.length : null;
   const page = filtered.slice(offset, offset + limit);
@@ -409,7 +417,6 @@ async function getLeaderboard(client, queryParams) {
 async function getLeaderboardWindows(client) {
   const alltimeCount = await client.zcard(ALLTIME_KEY);
 
-  // Scan for all daily and weekly keys to populate selectors
   const dailyDates = [];
   const weeklyWeeks = [];
 
@@ -443,7 +450,7 @@ async function getLeaderboardWindows(client) {
   });
 }
 
-// GET /leaderboard/stats — ship counts per window (Feature 5)
+// GET /leaderboard/stats
 async function getLeaderboardStats(client) {
   const dailyKey = getDailyKey();
   const weeklyKey = getWeeklyKey();
@@ -461,7 +468,7 @@ async function getLeaderboardStats(client) {
   });
 }
 
-// GET /leaderboard/above/{threshold}?window=alltime|daily|weekly&offset=0&limit=50 (Feature 3)
+// GET /leaderboard/above/{threshold}?window=alltime|daily|weekly&offset=0&limit=50
 async function getLeaderboardAbove(client, threshold, queryParams) {
   const parsed = Number(threshold);
   if (!isFinite(parsed)) {
@@ -475,7 +482,6 @@ async function getLeaderboardAbove(client, threshold, queryParams) {
   const offset = Math.max(0, Number(queryParams?.offset) || 0);
   const limit = Math.min(Math.max(1, Number(queryParams?.limit) || 50), 100);
 
-  // Fetch all entries with score >= threshold, highest first.
   const allResults = await client.zrangeWithScores(
     leaderboardKey,
     {
@@ -495,8 +501,6 @@ async function getLeaderboardAbove(client, threshold, queryParams) {
     });
   }
 
-  // Enrich all results with metadata (needed for class filtering)
-  // Process in batches of 200 to avoid oversized pipelines
   const enriched = [];
   const ENRICH_BATCH = 200;
   for (let i = 0; i < allResults.length; i += ENRICH_BATCH) {
@@ -521,7 +525,6 @@ async function getLeaderboardAbove(client, threshold, queryParams) {
       }
     }
 
-    // Early exit: if we have enough for offset + limit and no class filter, stop
     if (!classFilter && enriched.length >= offset + limit) break;
   }
 
@@ -591,7 +594,6 @@ async function postShipScore(client, shipId, body) {
   let newScore;
 
   if (updatePolicy === 'best') {
-    // Feature 2: ZADD GT — only update if the new score is higher
     for (const key of allKeys) {
       await client.zadd(
         key,
@@ -599,11 +601,9 @@ async function postShipScore(client, shipId, body) {
         { updateOptions: UpdateByScore.GREATER_THAN },
       );
     }
-    // Read back the current score from alltime
     const scoreRaw = await client.zscore(ALLTIME_KEY, shipId);
     newScore = Number(scoreRaw);
   } else {
-    // Feature 1: ZINCRBY into all three time-windowed keys
     const scoreRaw = await client.zincrby(ALLTIME_KEY, increment, shipId);
     newScore = Number(scoreRaw);
     await Promise.all([
@@ -612,14 +612,13 @@ async function postShipScore(client, shipId, body) {
     ]);
   }
 
-  // Feature 4: apply top-N cap if requested
   await applyTopNCap(client, topN);
 
   return respond(200, { shipId, score: newScore });
 }
 
 // POST /simulation/start — fan-out to multiple worker Lambdas
-async function startSimulation(body) {
+async function startSimulation(client, body) {
   let parsed;
   try {
     parsed = typeof body === 'string' ? JSON.parse(body || '{}') : (body || {});
@@ -638,35 +637,57 @@ async function startSimulation(body) {
     return respond(500, { message: 'WORKER_LAMBDA_ARN environment variable is not set' });
   }
 
-  // Load ship profiles from DynamoDB
+  // Load ship profiles from Valkey hashes
   let allProfiles = [];
-  if (PROFILES_TABLE) {
-    let lastKey;
-    do {
-      const scanResult = await ddbClient.send(new ScanCommand({
-        TableName: PROFILES_TABLE,
-        ExclusiveStartKey: lastKey,
-        Limit: 1000,
-      }));
-      allProfiles.push(...(scanResult.Items || []));
-      lastKey = scanResult.LastEvaluatedKey;
-    } while (lastKey);
-  }
+  let cursor = '0';
+  do {
+    const [nextCursor, keys] = await client.scan(cursor, { match: 'ship:*', count: 200 });
+    cursor = nextCursor;
+    if (keys.length > 0) {
+      const batch = new Batch(false);
+      for (const key of keys) {
+        batch.hgetall(key);
+      }
+      const results = await client.exec(batch, false);
+      for (let i = 0; i < keys.length; i++) {
+        const meta = hashToObj(results && results[i]);
+        if (meta.shipName) {
+          allProfiles.push({
+            shipId: keys[i].replace('ship:', ''),
+            shipName: meta.shipName,
+            pilotName: meta.pilotName || 'Unknown',
+            shipClass: meta.shipClass || 'Unknown',
+          });
+        }
+      }
+    }
+  } while (cursor !== '0');
 
   // If not enough profiles, auto-generate to meet the requested count
-  if (allProfiles.length < shipCount && PROFILES_TABLE) {
+  if (allProfiles.length < shipCount) {
     const needed = shipCount - allProfiles.length;
     const generated = [];
     for (let i = 0; i < needed; i++) {
       generated.push(generateProfile());
     }
 
-    for (let i = 0; i < generated.length; i += 25) {
-      const batch = generated.slice(i, i + 25).map(p => ({ PutRequest: { Item: p } }));
-      await ddbClient.send(new BatchWriteCommand({ RequestItems: { [PROFILES_TABLE]: batch } }));
+    // Write to Valkey in batches of 100
+    for (let i = 0; i < generated.length; i += 100) {
+      const chunk = generated.slice(i, i + 100);
+      const batch = new Batch(false);
+      for (const p of chunk) {
+        batch.hset(`ship:${p.shipId}`, {
+          shipName: p.shipName, pilotName: p.pilotName, shipClass: p.shipClass,
+          createdAt: p.createdAt, lastActiveAt: p.lastActiveAt,
+          totalSimulations: '0', lifetimeOreHauled: '0',
+        });
+      }
+      await client.exec(batch, false);
     }
 
-    allProfiles.push(...generated);
+    allProfiles.push(...generated.map(p => ({
+      shipId: p.shipId, shipName: p.shipName, pilotName: p.pilotName, shipClass: p.shipClass,
+    })));
     console.log(`Auto-generated ${needed} profiles to meet requested shipCount=${shipCount}`);
   }
 
@@ -676,12 +697,11 @@ async function startSimulation(body) {
     }));
   }
 
-  // Sample shipCount profiles (or take all if shipCount >= total)
+  // Sample shipCount profiles
   let selectedShips;
   if (shipCount >= allProfiles.length) {
     selectedShips = allProfiles;
   } else {
-    // Fisher-Yates partial shuffle
     const copy = [...allProfiles];
     selectedShips = [];
     for (let i = 0; i < shipCount; i++) {
@@ -690,16 +710,13 @@ async function startSimulation(body) {
     }
   }
 
-  // Cache selected profiles in Valkey as an ephemeral session.
-  // Workers pull their slice from cache instead of receiving full profile
-  // data in the invoke payload (avoids 256KB Lambda payload limit at scale).
-  const client = await getClient();
+  // Cache selected profiles in Valkey as an ephemeral session
   const sessionId = `sim-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
   const sessionKey = `session:${sessionId}`;
-  const sessionTtl = duration + 300; // keep cache alive for sim duration + 5 min buffer
+  const sessionTtl = duration + 300;
   await client.set(sessionKey, JSON.stringify(selectedShips), { expiry: { type: TimeUnit.Seconds, count: sessionTtl } });
 
-  // Fan out workers with lightweight payload — just session reference + slice indices
+  // Fan out workers
   const totalShips = selectedShips.length;
   const chunks = [];
   for (let i = 0; i < totalShips; i += chunkSize) {
@@ -737,11 +754,11 @@ async function startSimulation(body) {
 }
 
 // ---------------------------------------------------------------------------
-// Route handlers — Load Testing
+// Route handlers — Load Testing (metadata stored in Valkey hashes)
 // ---------------------------------------------------------------------------
 
-// POST /loadtest/start — Starts a phased load test
-async function startLoadTest(body) {
+// POST /loadtest/start
+async function startLoadTest(client, body) {
   let parsed;
   try { parsed = typeof body === 'string' ? JSON.parse(body || '{}') : (body || {}); }
   catch { return respond(400, { message: 'Invalid JSON' }); }
@@ -755,62 +772,83 @@ async function startLoadTest(body) {
   const tickInterval = Number(parsed.tickInterval) || 500;
   const updatePolicy = parsed.updatePolicy || 'cumulative';
 
-  // Write test metadata
-  await ddbClient.send(new PutCommand({
-    TableName: LOADTEST_TABLE,
-    Item: {
-      testId,
-      recordType: 'metadata',
-      status: 'running',
-      phases,
-      tickInterval,
-      updatePolicy,
-      startedAt: new Date().toISOString(),
-      totalWriters: phases.reduce((sum, p) => sum + p.writers, 0),
-      totalShips: phases.reduce((sum, p) => sum + p.writers * p.shipsPerWriter, 0),
-    },
-  }));
+  const totalWriters = phases.reduce((sum, p) => sum + p.writers, 0);
+  const totalShips = phases.reduce((sum, p) => sum + p.writers * p.shipsPerWriter, 0);
+
+  // Store test metadata in Valkey hash (durable)
+  await client.hset(`loadtest:${testId}`, {
+    testId,
+    status: 'running',
+    phases: JSON.stringify(phases),
+    tickInterval: String(tickInterval),
+    updatePolicy,
+    startedAt: new Date().toISOString(),
+    totalWriters: String(totalWriters),
+    totalShips: String(totalShips),
+  });
+
+  // Add to load test index set
+  await client.zadd('galactic:loadtests', [{ element: testId, score: Date.now() }]);
 
   // Load/generate profiles for all phases
   const maxShips = phases.reduce((max, p) => Math.max(max, p.writers * p.shipsPerWriter), 0);
 
-  // Load all profiles from DynamoDB
   let allProfiles = [];
-  if (PROFILES_TABLE) {
-    let lastKey;
-    do {
-      const scanResult = await ddbClient.send(new ScanCommand({
-        TableName: PROFILES_TABLE,
-        ExclusiveStartKey: lastKey,
-        Limit: 1000,
-      }));
-      allProfiles.push(...(scanResult.Items || []));
-      lastKey = scanResult.LastEvaluatedKey;
-    } while (lastKey);
-  }
+  let cursor = '0';
+  do {
+    const [nextCursor, keys] = await client.scan(cursor, { match: 'ship:*', count: 200 });
+    cursor = nextCursor;
+    if (keys.length > 0) {
+      const batch = new Batch(false);
+      for (const key of keys) {
+        batch.hgetall(key);
+      }
+      const results = await client.exec(batch, false);
+      for (let i = 0; i < keys.length; i++) {
+        const meta = hashToObj(results && results[i]);
+        if (meta.shipName) {
+          allProfiles.push({
+            shipId: keys[i].replace('ship:', ''),
+            shipName: meta.shipName,
+            pilotName: meta.pilotName || 'Unknown',
+            shipClass: meta.shipClass || 'Unknown',
+          });
+        }
+      }
+    }
+  } while (cursor !== '0');
 
   // Auto-generate if needed
-  if (allProfiles.length < maxShips && PROFILES_TABLE) {
+  if (allProfiles.length < maxShips) {
     const needed = maxShips - allProfiles.length;
     const generated = [];
     for (let i = 0; i < needed; i++) {
       generated.push(generateProfile());
     }
-    for (let i = 0; i < generated.length; i += 25) {
-      const batch = generated.slice(i, i + 25).map(p => ({ PutRequest: { Item: p } }));
-      await ddbClient.send(new BatchWriteCommand({ RequestItems: { [PROFILES_TABLE]: batch } }));
+    for (let i = 0; i < generated.length; i += 100) {
+      const chunk = generated.slice(i, i + 100);
+      const batch = new Batch(false);
+      for (const p of chunk) {
+        batch.hset(`ship:${p.shipId}`, {
+          shipName: p.shipName, pilotName: p.pilotName, shipClass: p.shipClass,
+          createdAt: p.createdAt, lastActiveAt: p.lastActiveAt,
+          totalSimulations: '0', lifetimeOreHauled: '0',
+        });
+      }
+      await client.exec(batch, false);
     }
-    allProfiles.push(...generated);
+    allProfiles.push(...generated.map(p => ({
+      shipId: p.shipId, shipName: p.shipName, pilotName: p.pilotName, shipClass: p.shipClass,
+    })));
   }
 
   // Cache all profiles in Valkey session for workers to pull from
-  const client = await getClient();
   const sessionKey = `session:${testId}`;
   const totalDuration = phases.reduce((sum, p) => sum + p.duration, 0);
   const sessionTtl = totalDuration + 300;
   await client.set(sessionKey, JSON.stringify(allProfiles), { expiry: { type: TimeUnit.Seconds, count: sessionTtl } });
 
-  // Launch all phases with staggered start delays — workers reference the session
+  // Launch all phases with staggered start delays
   const workerArn = process.env.WORKER_LAMBDA_ARN;
   let globalWorkerIdx = 0;
   let phaseStartDelay = 0;
@@ -857,11 +895,6 @@ async function getEvents(client, queryParams) {
   const since = (queryParams && queryParams.since) || '0-0';
   const limit = Math.min(Math.max(1, Number(queryParams?.limit) || 50), 200);
 
-  // XRANGE: get entries after `since` (exclusive — use since as start, then skip first if it matches)
-  // Actually XRANGE is inclusive, so to get "after since" we use the next possible ID
-  const startId = since === '0-0' ? '-' : `(${since}`;
-
-  // GLIDE xrange uses Boundary<string> — InfBoundary.NegativeInfinity for "-"
   let results;
   if (since === '0-0') {
     results = await client.xrange(
@@ -871,7 +904,6 @@ async function getEvents(client, queryParams) {
       { count: limit },
     );
   } else {
-    // Exclusive start: use the ID format "(id" — GLIDE uses Boundary with isInclusive
     results = await client.xrange(
       'galactic:events',
       { value: since, isInclusive: false },
@@ -880,8 +912,6 @@ async function getEvents(client, queryParams) {
     );
   }
 
-  // xrange returns Record<string, [GlideString, GlideString][]> | null
-  // Keys are stream entry IDs, values are arrays of [field, value] pairs
   const events = [];
   if (results && typeof results === 'object') {
     const entries = Object.entries(results);
@@ -907,33 +937,82 @@ async function getEvents(client, queryParams) {
 }
 
 // GET /loadtests — List all load tests
-async function listLoadTests() {
-  const result = await ddbClient.send(new ScanCommand({
-    TableName: LOADTEST_TABLE,
-    FilterExpression: 'recordType = :meta',
-    ExpressionAttributeValues: { ':meta': 'metadata' },
-  }));
-  const tests = (result.Items || []).sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+async function listLoadTests(client) {
+  const testIds = await client.zrangeWithScores('galactic:loadtests', { start: 0, end: -1 }, { reverse: true });
+  if (!testIds || testIds.length === 0) {
+    return respond(200, []);
+  }
+
+  const batch = new Batch(false);
+  for (const entry of testIds) {
+    batch.hgetall(`loadtest:${String(entry.element)}`);
+  }
+  const results = await client.exec(batch, false);
+
+  const tests = [];
+  for (let i = 0; i < testIds.length; i++) {
+    const meta = hashToObj(results && results[i]);
+    if (meta.testId) {
+      tests.push({
+        testId: meta.testId,
+        status: meta.status || 'unknown',
+        phases: meta.phases ? JSON.parse(meta.phases) : [],
+        tickInterval: Number(meta.tickInterval) || 500,
+        updatePolicy: meta.updatePolicy || 'cumulative',
+        startedAt: meta.startedAt || null,
+        completedAt: meta.completedAt || null,
+        totalWriters: Number(meta.totalWriters) || 0,
+        totalShips: Number(meta.totalShips) || 0,
+      });
+    }
+  }
+
   return respond(200, tests);
 }
 
 // GET /loadtest/{id} — Get full results for a test
-async function getLoadTestResults(testId) {
-  // Query all records for this testId (metadata + worker results)
-  const result = await ddbClient.send(new ScanCommand({
-    TableName: LOADTEST_TABLE,
-    FilterExpression: 'testId = :id',
-    ExpressionAttributeValues: { ':id': testId },
-  }));
+async function getLoadTestResults(client, testId) {
+  const rawMeta = await client.hgetall(`loadtest:${testId}`);
+  const metadata = hashToObj(rawMeta);
 
-  const items = result.Items || [];
-  const metadata = items.find(i => i.recordType === 'metadata');
-  const workerResults = items.filter(i => i.recordType.startsWith('worker-'))
-    .sort((a, b) => a.workerId - b.workerId);
-
-  if (!metadata) {
+  if (!metadata.testId) {
     return respond(404, { message: 'Load test not found' });
   }
+
+  // Get all worker results from the sorted set
+  const workerIds = await client.zrangeWithScores(`loadtest:${testId}:workers`, { start: 0, end: -1 });
+  const workerResults = [];
+
+  if (workerIds && workerIds.length > 0) {
+    const batch = new Batch(false);
+    for (const entry of workerIds) {
+      batch.hgetall(`loadtest:${testId}:worker:${String(entry.element)}`);
+    }
+    const results = await client.exec(batch, false);
+
+    for (let i = 0; i < workerIds.length; i++) {
+      const w = hashToObj(results && results[i]);
+      if (w.workerId !== undefined) {
+        workerResults.push({
+          workerId: Number(w.workerId),
+          shipCount: Number(w.shipCount) || 0,
+          totalUpdates: Number(w.totalUpdates) || 0,
+          duration: Number(w.duration) || 0,
+          tickInterval: Number(w.tickInterval) || 500,
+          latencyMs: w.latencyMs ? JSON.parse(w.latencyMs) : null,
+          opsPerSecond: Number(w.opsPerSecond) || 0,
+          phase: w.phase !== 'null' ? Number(w.phase) : null,
+          completedAt: w.completedAt || null,
+        });
+      }
+    }
+  }
+
+  workerResults.sort((a, b) => a.workerId - b.workerId);
+
+  const phases = metadata.phases ? JSON.parse(metadata.phases) : [];
+  const expectedWorkers = Number(metadata.totalWriters) || 0;
+  const completedWorkers = workerResults.length;
 
   // Aggregate stats
   const totalOps = workerResults.reduce((sum, w) => sum + (w.totalUpdates || 0), 0);
@@ -953,36 +1032,36 @@ async function getLoadTestResults(testId) {
     };
   }
 
-  const totalDuration = metadata.phases.reduce((sum, p) => sum + p.duration, 0);
-  const completedWorkers = workerResults.length;
-  const expectedWorkers = metadata.totalWriters;
+  const totalDuration = phases.reduce((sum, p) => sum + p.duration, 0);
 
   // Update status if all workers reported
   if (completedWorkers >= expectedWorkers && metadata.status === 'running') {
-    await ddbClient.send(new UpdateCommand({
-      TableName: LOADTEST_TABLE,
-      Key: { testId, recordType: 'metadata' },
-      UpdateExpression: 'SET #s = :done, completedAt = :now',
-      ExpressionAttributeNames: { '#s': 'status' },
-      ExpressionAttributeValues: { ':done': 'completed', ':now': new Date().toISOString() },
-    }));
+    await client.hset(`loadtest:${testId}`, { status: 'completed', completedAt: new Date().toISOString() });
     metadata.status = 'completed';
   }
 
   return respond(200, {
-    ...metadata,
+    testId: metadata.testId,
+    status: metadata.status,
+    phases,
+    tickInterval: Number(metadata.tickInterval) || 500,
+    updatePolicy: metadata.updatePolicy || 'cumulative',
+    startedAt: metadata.startedAt || null,
+    completedAt: metadata.completedAt || null,
+    totalWriters: expectedWorkers,
+    totalShips: Number(metadata.totalShips) || 0,
     results: {
       completedWorkers,
       expectedWorkers,
       totalOps,
-      aggregateOpsPerSecond: Math.round(totalOps / totalDuration),
+      aggregateOpsPerSecond: totalDuration > 0 ? Math.round(totalOps / totalDuration) : 0,
       aggregateLatency,
       workers: workerResults,
     },
   });
 }
 
-// POST /leaderboard/topn — apply top-N pruning to a specific window (Feature 4)
+// POST /leaderboard/topn
 async function postLeaderboardTopN(client, body) {
   let parsed;
   try {
@@ -1001,7 +1080,6 @@ async function postLeaderboardTopN(client, body) {
 
   const leaderboardKey = resolveWindowKey(window, queryParams);
 
-  // Remove all entries ranked topN and below (0-based), keeping only the top N
   await client.zremRangeByRank(leaderboardKey, topN, -1);
 
   const remaining = await client.zcard(leaderboardKey);
@@ -1010,12 +1088,10 @@ async function postLeaderboardTopN(client, body) {
 
 // DELETE /leaderboard — reset all leaderboard data (all three windows + ship hashes)
 async function resetLeaderboard(client) {
-  // Delete the canonical alltime key, today's daily key, and this week's weekly key
   await client.del([ALLTIME_KEY]);
   await client.del([getDailyKey()]);
   await client.del([getWeeklyKey()]);
 
-  // Scan and delete any remaining galactic:leaderboard:daily:* keys
   let cursor = '0';
   do {
     const [nextCursor, keys] = await client.scan(cursor, { match: 'galactic:leaderboard:daily:*', count: 100 });
@@ -1025,7 +1101,6 @@ async function resetLeaderboard(client) {
     }
   } while (cursor !== '0');
 
-  // Scan and delete any remaining galactic:leaderboard:weekly:* keys
   cursor = '0';
   do {
     const [nextCursor, keys] = await client.scan(cursor, { match: 'galactic:leaderboard:weekly:*', count: 100 });
@@ -1035,8 +1110,6 @@ async function resetLeaderboard(client) {
     }
   } while (cursor !== '0');
 
-  // Scan and delete ship:* hash keys one at a time to avoid CrossSlot errors
-  // (ElastiCache Serverless uses cluster-mode routing internally)
   cursor = '0';
   do {
     const [nextCursor, keys] = await client.scan(cursor, { match: 'ship:*', count: 100 });
@@ -1060,25 +1133,20 @@ exports.handler = async (event) => {
     const queryParams = event.queryStringParameters || {};
 
     switch (routeKey) {
-      // Feature 1: window-aware leaderboard
       case 'GET /leaderboard':
         return await getLeaderboard(client, queryParams);
 
-      // Feature 1: which windows have data
       case 'GET /leaderboard/windows':
         return await getLeaderboardWindows(client);
 
-      // Feature 5: live ship-count badge
       case 'GET /leaderboard/stats':
         return await getLeaderboardStats(client);
 
-      // Feature 3: score threshold filter
       case 'GET /leaderboard/above/{threshold}':
         return await getLeaderboardAbove(client, pathParams.threshold, queryParams);
 
-      // DynamoDB ship profiles
       case 'GET /ships':
-        return await listShipProfiles();
+        return await listShipProfiles(client);
       case 'GET /ships/{id}':
         return await getShipProfile(client, pathParams.id);
       case 'POST /ships':
@@ -1086,9 +1154,8 @@ exports.handler = async (event) => {
       case 'POST /ships/seed':
         return await seedShipProfiles(client);
       case 'POST /ships/generate':
-        return await generateShipProfiles(event.body);
+        return await generateShipProfiles(client, event.body);
 
-      // Feature 1: window-aware rank lookup
       case 'GET /ships/{id}/rank':
         return await getShipRank(client, pathParams.id, queryParams);
 
@@ -1096,21 +1163,18 @@ exports.handler = async (event) => {
         return await postShipScore(client, pathParams.id, event.body);
 
       case 'POST /simulation/start':
-        return await startSimulation(event.body);
+        return await startSimulation(client, event.body);
 
-      // Load testing
       case 'POST /loadtest/start':
-        return await startLoadTest(event.body);
+        return await startLoadTest(client, event.body);
       case 'GET /loadtest/{id}':
-        return await getLoadTestResults(pathParams.id);
+        return await getLoadTestResults(client, pathParams.id);
       case 'GET /loadtests':
-        return await listLoadTests();
+        return await listLoadTests(client);
 
-      // Event stream
       case 'GET /events':
         return await getEvents(client, queryParams);
 
-      // Feature 4: explicit top-N pruning endpoint
       case 'POST /leaderboard/topn':
         return await postLeaderboardTopN(client, event.body);
 

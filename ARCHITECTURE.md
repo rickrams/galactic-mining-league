@@ -15,14 +15,12 @@ graph TB
         end
 
         APIGW["API Gateway HTTP API<br/>(CORS enabled)"]
-        DDB["DynamoDB<br/>GalacticMiningProfiles +<br/>GalacticMiningLoadTests"]
 
         subgraph "VPC (10.0.0.0/16) — Fully Private, No NAT"
             subgraph "Isolated Subnets (2 AZs)"
                 API_LAMBDA["API Lambda<br/>galactic-mining-api<br/>(Node.js 22.x, 60s timeout)"]
                 WORKER_LAMBDA["Worker Lambda ×N<br/>galactic-mining-worker<br/>(Node.js 22.x, 5min timeout)<br/>Fan-out: up to 200 concurrent"]
-                VALKEY["ElastiCache Serverless<br/>(Valkey engine)<br/>galactic-mining<br/>(TLS, port 6379)"]
-                VPCE_DDB["VPC Gateway Endpoint<br/>(DynamoDB)"]
+                VALKEY["ElastiCache Valkey 9.0<br/>r7g.large, Multi-AZ<br/>Synchronous Durability<br/>(TLS, port 6379)"]
                 VPCE_LAMBDA["VPC Interface Endpoint<br/>(Lambda — PrivateLink)"]
             end
         end
@@ -34,40 +32,41 @@ graph TB
     APIGW --> API_LAMBDA
     API_LAMBDA -->|"TLS :6379"| VALKEY
     WORKER_LAMBDA -->|"TLS :6379<br/>Batch pipeline"| VALKEY
-    API_LAMBDA -->|"private"| VPCE_DDB
-    WORKER_LAMBDA -->|"private"| VPCE_DDB
-    VPCE_DDB -->|"AWS backbone"| DDB
     API_LAMBDA -->|"Invoke ×N<br/>(fan-out)"| VPCE_LAMBDA
     VPCE_LAMBDA -->|"PrivateLink"| WORKER_LAMBDA
 ```
 
-All traffic stays on AWS private networking. No NAT gateway, no internet egress. DynamoDB access via Gateway Endpoint (free). Lambda invocation via Interface Endpoint (PrivateLink).
+All traffic stays on AWS private networking. No NAT gateway, no internet egress. Lambda invocation via Interface Endpoint (PrivateLink). ElastiCache cluster in the same isolated subnets.
 
-## Data Flow: Write-Through Cache Pattern
+## Data Flow: Single-Tier Durable Pattern
 
 ```mermaid
 graph LR
-    subgraph "DynamoDB — Durable Store"
-        DDB_TABLE["GalacticMiningProfiles<br/>(source of truth)"]
-        DDB_ITEM["shipId: ship-01234<br/>shipName: ISS Quantum Bringer<br/>pilotName: Kael Dryden<br/>shipClass: Excavator<br/>createdAt: 2026-05-27T...<br/>lastActiveAt: 2026-05-27T...<br/>totalSimulations: 8<br/>lifetimeOreHauled: 175,970"]
-    end
-
-    subgraph "ElastiCache Serverless — Hot Path"
+    subgraph "ElastiCache Valkey 9.0 (Synchronous Durability)"
         ZSETS["Sorted Sets<br/>(leaderboard rankings)"]
-        HASHES["Hashes<br/>(metadata + lifetime stats)"]
+        HASHES["Hashes<br/>(durable ship profiles +<br/>lifetime stats)"]
+        STREAMS["Streams<br/>(event log)"]
     end
 
-    DDB_TABLE -->|"1. Load profiles<br/>at sim start"| ZSETS
-    DDB_TABLE -->|"2. UpdateItem<br/>ReturnValues: ALL_NEW"| DDB_ITEM
-    DDB_ITEM -->|"3. Write-through<br/>HSET lifetime stats"| HASHES
-    ZSETS -->|"4. Leaderboard reads<br/>enrich from hash"| HASHES
+    subgraph "Workers"
+        W["Worker Lambda ×N"]
+    end
+
+    W -->|"1. HSET ship:{id}<br/>register metadata"| HASHES
+    W -->|"2. ZINCRBY / ZADD GT<br/>score updates"| ZSETS
+    W -->|"3. HINCRBY<br/>lifetime stats"| HASHES
+    W -->|"4. XADD<br/>events"| STREAMS
+    ZSETS -->|"5. Leaderboard reads<br/>enrich from hash"| HASHES
 ```
 
-The write-through flow:
-1. Worker loads profiles from DynamoDB, registers them in sorted sets
-2. After simulation, worker increments `totalSimulations` and `lifetimeOreHauled` in DynamoDB
-3. DynamoDB returns the new values (`ReturnValues: ALL_NEW`)
-4. Worker writes updated stats to Valkey hash — leaderboard reads pick them up for free
+With synchronous durability, every write to a hash or sorted set is persisted across at least two AZs before the response returns to the client. No separate database needed — Valkey **is** the durable store.
+
+The flow:
+1. Worker registers ship metadata in hash (durable on write)
+2. Mining loop: atomic score updates to sorted sets across 3 time windows
+3. Post-simulation: `HINCRBY` increments lifetime counters directly in the hash
+4. Workers emit events to a capped stream throughout
+5. Leaderboard reads combine sorted set rank/score with hash metadata in one pipeline
 
 ## Data Model (Valkey)
 
@@ -79,8 +78,18 @@ graph LR
         C["galactic:leaderboard:weekly:YYYY-Wnn"]
     end
 
-    subgraph "Hashes — Metadata + Lifetime Cache"
-        H["ship:{shipId}<br/>{shipName, pilotName, shipClass,<br/>totalSimulations, lifetimeOreHauled}"]
+    subgraph "Hashes — Durable Profiles + Stats"
+        H["ship:{shipId}<br/>{shipName, pilotName, shipClass,<br/>createdAt, lastActiveAt,<br/>totalSimulations, lifetimeOreHauled}"]
+    end
+
+    subgraph "Hashes — Load Test Metadata"
+        LT["loadtest:{testId}<br/>{status, phases, startedAt, ...}"]
+        LTW["loadtest:{testId}:worker:{id}<br/>{latencyMs, opsPerSecond, ...}"]
+    end
+
+    subgraph "Sorted Sets — Indexes"
+        LTI["galactic:loadtests<br/>(testId scored by timestamp)"]
+        LTWI["loadtest:{testId}:workers<br/>(workerId scored by id)"]
     end
 
     subgraph "Streams — Event Log"
@@ -104,19 +113,19 @@ graph LR
 | `GET` | `/leaderboard/windows` | `SCAN` pattern match | Discover all available date/week keys |
 | `GET` | `/leaderboard/stats` | `ZCARD` ×3 | Ship counts per window |
 | `GET` | `/leaderboard/above/{threshold}?window=&shipClass=` | `ZRANGEWITHSCORES` byScore + `HGETALL` batch | Score threshold + class filter |
-| `GET` | `/ships` | DynamoDB `Scan` | List all profiles |
-| `GET` | `/ships/{id}` | DynamoDB `GetItem` + `ZREVRANK`, `ZSCORE` | Profile with live rank |
+| `GET` | `/ships` | `SCAN ship:*` + `HGETALL` batch | List all profiles |
+| `GET` | `/ships/{id}` | `HGETALL` + `ZREVRANK`, `ZSCORE` | Profile with live rank |
 | `GET` | `/ships/{id}/rank?window=` | `ZREVRANK`, `ZSCORE`, `HGETALL` | Rank in specific window |
-| `POST` | `/ships` | DynamoDB `PutItem` + `HSET` | Create profile |
-| `POST` | `/ships/seed` | DynamoDB `BatchWrite` + `HSET` batch | Seed 20 starter profiles |
-| `POST` | `/ships/generate` | DynamoDB `BatchWrite` ×N | Generate 100–5000 synthetic profiles |
+| `POST` | `/ships` | `HSET` | Create profile |
+| `POST` | `/ships/seed` | `HSET` batch | Seed 20 starter profiles |
+| `POST` | `/ships/generate` | `HSET` batch ×N | Generate 100–5000 synthetic profiles |
 | `POST` | `/ships/{id}/score` | `ZINCRBY` or `ZADD GT` | Manual score update |
-| `POST` | `/simulation/start` | DynamoDB `Scan` + Lambda `Invoke` ×N | Fan-out fleet simulation |
+| `POST` | `/simulation/start` | `SCAN` + Lambda `Invoke` ×N | Fan-out fleet simulation |
 | `POST` | `/leaderboard/topn` | `ZREMRANGEBYRANK`, `ZCARD` | Prune to top-N |
 | `GET` | `/events?since=&limit=` | `XRANGE`, `XLEN` | Incremental event stream consumption |
-| `POST` | `/loadtest/start` | DynamoDB + Lambda `Invoke` ×N (phased) | Phased load test with ramp-up |
-| `GET` | `/loadtest/{id}` | DynamoDB `Scan` + aggregate | Load test results with latency percentiles |
-| `GET` | `/loadtests` | DynamoDB `Scan` | List all load tests |
+| `POST` | `/loadtest/start` | `HSET` + Lambda `Invoke` ×N (phased) | Phased load test with ramp-up |
+| `GET` | `/loadtest/{id}` | `HGETALL` + aggregate worker results | Load test results with latency percentiles |
+| `GET` | `/loadtests` | `ZRANGEWITHSCORES` index + `HGETALL` batch | List all load tests |
 | `DELETE` | `/leaderboard` | `DEL`, `SCAN` + `DEL` | Full leaderboard reset |
 
 ## Simulation Flow (Fan-Out Architecture)
@@ -125,20 +134,19 @@ graph LR
 sequenceDiagram
     participant UI as React UI
     participant API as API Lambda
-    participant DDB as DynamoDB
     participant W1 as Worker #1
     participant W2 as Worker #2
     participant WN as Worker #N
-    participant V as ElastiCache Serverless
+    participant V as ElastiCache Valkey 9.0
 
     UI->>API: POST /simulation/start<br/>{shipCount:2000, duration:30, chunkSize:50}
-    API->>DDB: Scan profiles (auto-generate if < 2000 exist)
-    DDB-->>API: 2000 profiles
+    API->>V: SCAN ship:* (load profiles, auto-generate if < 2000 exist)
+    V-->>API: 2000 profiles
 
     par Fan-out (40 workers × 50 ships each)
-        API->>W1: InvokeAsync {ships[0..49], duration:30}
-        API->>W2: InvokeAsync {ships[50..99], duration:30}
-        API->>WN: InvokeAsync {ships[1950..1999], duration:30}
+        API->>W1: InvokeAsync {sessionKey, startIndex:0, shipCount:50}
+        API->>W2: InvokeAsync {sessionKey, startIndex:50, shipCount:50}
+        API->>WN: InvokeAsync {sessionKey, startIndex:1950, shipCount:50}
     end
 
     API-->>UI: 202 {workerCount: 40, shipCount: 2000}
@@ -153,13 +161,10 @@ sequenceDiagram
 
     Note over W1,WN: ~360,000 total Valkey writes over 30s
 
-    par Post-simulation: write-through cache update
-        W1->>DDB: UpdateItem ×50 (ReturnValues: ALL_NEW)
-        DDB-->>W1: Updated lifetime stats
-        W1->>V: HSET ×50 (sync lifetime stats to hash)
-        W2->>DDB: UpdateItem ×50
-        DDB-->>W2: Updated lifetime stats
-        W2->>V: HSET ×50
+    par Post-simulation: update lifetime stats in-place
+        W1->>V: HINCRBY ×50 (totalSimulations, lifetimeOreHauled)
+        W2->>V: HINCRBY ×50
+        WN->>V: HINCRBY ×50
     end
 
     loop Every 2s (UI polling)
@@ -175,14 +180,13 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant API as API Lambda
-    participant DDB as DynamoDB
+    participant V as ElastiCache Valkey 9.0
     participant P1 as Phase 1 Workers (×10)
     participant P2 as Phase 2 Workers (×30)
     participant P3 as Phase 3 Workers (×100)
-    participant V as ElastiCache Serverless
 
-    API->>DDB: Write test metadata (testId, phases, status:running)
-    
+    API->>V: HSET loadtest:{id} (metadata: phases, status:running)
+
     par All phases launched simultaneously with staggered startDelay
         API->>P1: Invoke ×10 (startDelay: 0s)
         API->>P2: Invoke ×30 (startDelay: 20s)
@@ -191,20 +195,20 @@ sequenceDiagram
 
     Note over P1: Phase 1: 10 workers start immediately
     P1->>V: 5,000 ops/sec for 20s
-    
+
     Note over P2: Phase 2: 30 workers start at t+20s
     P2->>V: 15,000 ops/sec for 20s
 
     Note over P3: Phase 3: 100 workers start at t+40s
     P3->>V: 50,000 ops/sec for 20s
 
-    par Each worker reports results
-        P1->>DDB: PutItem {latencyMs: {p50, p95, p99, max}, opsPerSecond, ...}
-        P2->>DDB: PutItem {latencyMs: ...}
-        P3->>DDB: PutItem {latencyMs: ...}
+    par Each worker reports results to Valkey
+        P1->>V: HSET loadtest:{id}:worker:{n} {latencyMs, opsPerSecond, ...}
+        P2->>V: HSET loadtest:{id}:worker:{n} {latencyMs, ...}
+        P3->>V: HSET loadtest:{id}:worker:{n} {latencyMs, ...}
     end
 
-    Note over API: GET /loadtest/{id} aggregates all worker results
+    Note over API: GET /loadtest/{id} aggregates all worker results from hashes
 ```
 
 ## Valkey Features Demonstrated
@@ -221,15 +225,17 @@ sequenceDiagram
 | **ZCOUNT** | Count members in score range | Threshold badge |
 | **ZCARD** | Total member count per window | Stats cards |
 | **ZREMRANGEBYRANK** | Top-N cap enforcement per tick | Prune to top 10–500 |
-| **HSET / HGETALL** | Metadata + lifetime stats cache (write-through from DynamoDB) | Batch 50–200 per page |
+| **HSET / HGETALL** | Durable ship profiles + lifetime stats (source of truth) | Batch 50–200 per page |
+| **HINCRBY** | Atomic counter increment for lifetime stats | Per-ship post-simulation |
 | **XADD + MAXLEN** | Capped event stream — workers emit tick/start/complete events | ~1000 entries, auto-trimmed |
 | **XRANGE** | Incremental stream reads — frontend polls with exclusive start ID | 20 events/poll, 1s interval |
 | **XLEN** | Stream depth indicator in UI | Live count |
 | **SET + EX** | Ephemeral session cache — profile data shared across workers via TTL key | 2000+ profiles, 5min TTL |
 | **GET** | Workers read session cache to retrieve their ship slice | N concurrent readers, one key |
-| **SCAN** | Safe key enumeration (reset, window discovery) | Pattern: `galactic:leaderboard:*` |
+| **SCAN** | Safe key enumeration (reset, window discovery, profile listing) | Pattern: `ship:*`, `galactic:leaderboard:*` |
 | **Pipelining (Batch)** | Bulk operations — one round-trip per tick per worker | 150 ops/batch × 100 workers |
-| **TLS** | Encrypted transport (required by ElastiCache Serverless) | All connections |
+| **TLS** | Encrypted transport (in-transit encryption enabled) | All connections |
+| **Synchronous Durability** | Every write persisted across 2+ AZs before response | All writes — zero data loss design |
 | **Concurrent writers** | Up to 200 Lambda workers writing to same sorted sets | Lock-free, linear scaling to 50K ops/sec |
 
 ## Infrastructure (CDK)
@@ -240,19 +246,18 @@ galactic-mining-league/
 ├── lib/                      # CDK stack definition
 │   └── galactic-mining-league-stack.ts
 │       ├── VPC (2 AZ, isolated subnets, no NAT)
-│       ├── VPC Endpoints (DynamoDB Gateway + Lambda PrivateLink)
+│       ├── VPC Endpoint (Lambda PrivateLink)
 │       ├── Security Groups (Lambda ↔ Valkey)
-│       ├── ElastiCache Serverless (Valkey engine)
-│       ├── DynamoDB Tables ×2 (Profiles + LoadTests, PAY_PER_REQUEST)
+│       ├── ElastiCache Replication Group (Valkey 9.0, r7g.large, Multi-AZ, Sync Durability)
 │       ├── Lambda: API (NodejsFunction, esbuild bundled)
 │       ├── Lambda: Worker (NodejsFunction, esbuild bundled)
 │       ├── API Gateway HTTP API (17 route paths)
 │       ├── S3 + CloudFront (OAC, SPA routing)
 │       └── BucketDeployment (frontend + config.json)
 ├── lambda/
-│   ├── api/handler.js        # All API routes (GLIDE + DynamoDB)
+│   ├── api/handler.js        # All API routes (GLIDE client only)
 │   ├── worker/handler.js     # Simulation engine (fan-out, latency tracking)
-│   └── package.json          # @valkey/valkey-glide + @aws-sdk
+│   └── package.json          # @valkey/valkey-glide + @aws-sdk/client-lambda
 ├── frontend/
 │   ├── src/
 │   │   ├── App.tsx           # Polling, pagination, filters, tabs
@@ -270,10 +275,12 @@ galactic-mining-league/
 
 | Decision | Rationale |
 |---|---|
-| ElastiCache Serverless for leaderboard, DynamoDB for profiles | Sorted sets give O(log N) rank ops; DynamoDB gives durable identity that survives resets |
-| Write-through cache pattern | Worker writes lifetime stats to both DynamoDB (durable) and Valkey hash (fast reads) — leaderboard page never hits DynamoDB |
-| Fan-out workers (not single Lambda) | Simulates realistic concurrent writer load; tests ElastiCache Serverless lock-free sorted set under contention |
-| Fully private VPC (no NAT) | DynamoDB Gateway Endpoint + Lambda PrivateLink = zero egress cost, all traffic on AWS backbone |
+| ElastiCache with synchronous durability as sole data store | Valkey 9.0 durability eliminates the need for a separate database — sorted sets give O(log N) rank ops, hashes give durable profile storage, all in one service |
+| Node-based (r7g.large) over Serverless | Predictable performance characteristics for load testing; explicit control over instance type and Multi-AZ topology |
+| Synchronous over asynchronous durability | Zero data loss guarantee — every write confirmed across 2+ AZs before response. Profile data and lifetime stats cannot tolerate any loss window |
+| `HINCRBY` for lifetime stats | Atomic increment directly in the hash — no read-modify-write cycle, no separate counter table, no eventual consistency |
+| Fan-out workers (not single Lambda) | Simulates realistic concurrent writer load; tests lock-free sorted set behavior under contention |
+| Fully private VPC (no NAT) | Lambda PrivateLink = zero egress cost, all traffic on AWS backbone |
 | Server-side class filter via over-fetch | No native secondary index in sorted sets; scan-and-filter with early-exit is fast enough at scale |
 | Pagination via ZRANGEWITHSCORES offset | O(log N + M) — efficient for any page depth |
 | Time-windowed keys (daily/weekly/alltime) | Separate sorted sets per window = independent lifecycle, no cross-contamination |
