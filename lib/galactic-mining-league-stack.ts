@@ -93,8 +93,7 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
       clusterMode: 'disabled',
     });
     valkeyCluster.addDependency(subnetGroup);
-    // NOTE: Enable synchronous durability via console or CLI once CloudFormation
-    // support lands (feature announced 2026-06-02, CFN property not yet available)
+    valkeyCluster.addPropertyOverride('Durability', 'sync');
 
     const valkeyEndpoint = `${valkeyCluster.attrPrimaryEndPointAddress}:${valkeyCluster.attrPrimaryEndPointPort}`;
 
