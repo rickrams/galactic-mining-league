@@ -109,8 +109,9 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
       depsLockFilePath: path.join(__dirname, '../lambda/package-lock.json'),
       bundling: {
         externalModules: ['@aws-sdk/*'],
-        nodeModules: ['@valkey/valkey-glide'],
+        nodeModules: ['@valkey/valkey-glide', '@valkey/valkey-glide-linux-x64-gnu'],
         sourceMap: false,
+        forceDockerBundling: true,
       },
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
@@ -134,8 +135,9 @@ export class GalacticMiningLeagueStack extends cdk.Stack {
       depsLockFilePath: path.join(__dirname, '../lambda/package-lock.json'),
       bundling: {
         externalModules: ['@aws-sdk/*'],
-        nodeModules: ['@valkey/valkey-glide'],
+        nodeModules: ['@valkey/valkey-glide', '@valkey/valkey-glide-linux-x64-gnu'],
         sourceMap: false,
+        forceDockerBundling: true,
       },
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },

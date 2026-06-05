@@ -12,6 +12,7 @@
   "type": "commonjs",
   "dependencies": {
     "@aws-sdk/client-lambda": "^3.1054.0",
-    "@valkey/valkey-glide": "^2.4.0"
+    "@valkey/valkey-glide": "^2.4.0",
+    "@valkey/valkey-glide-linux-x64-gnu": "^2.4.0"
   }
 }
